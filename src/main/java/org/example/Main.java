@@ -20,10 +20,10 @@ import org.partiql.lang.eval.Expression;
 public class Main {
     static void main() {
         String jsons = """
-                {"id": "1", "name": "person_1", "age": 32, "address": "555 1st street, Seattle", "tags": []}
-                {"id": "2", "name": "person_2", "age": 24}
-                {"id": "3", "name": "person_3", "age": 25, "address": {"number": 555, "street": "1st street", "city": "Seattle"}, "tags": ["premium_user"]}
-                """;
+            {"id": "1", "name": "person_1", "age": 32, "address": "555 1st street, Seattle", "tags": []}
+            {"id": "2", "name": "person_2", "age": 24}
+            {"id": "3", "name": "person_3", "age": 25, "address": {"number": 555, "street": "1st street", "city": "Seattle"}, "tags": ["premium_user"]}
+            """;
 
         // Initializes the ion system used by PartiQL
         final IonSystem ion = IonSystemBuilder.standard().build();
@@ -33,16 +33,16 @@ public class Main {
         // Compiles the query, the resulting expression can be re-used to query multiple
         // data sets
         String sql = """
-                SELECT payload.name, payload.address, payload.tags
-                FROM payload
-                WHERE payload.age < 30 and payload.address.number = 555
-                """;
+            SELECT payload.name, payload.address, payload.tags
+            FROM payload
+            WHERE payload.age < 30 and payload.address.number = 555
+            """;
 
         sql = """
-                        SELECT *
-                        FROM payload
-                        WHERE payload.age < 30 and payload.address.number = 555
-                        """;
+            SELECT *
+            FROM payload
+            WHERE payload.age < 30 and payload.address.number = 555
+            """;
         final Expression selectAndFilter = pipeline.compile(sql);
 
         // We are using ion-java to parse the JSON data as PartiQL comes with an
@@ -60,15 +60,15 @@ public class Main {
         // expression, including the
         // global bindings
         final EvaluationSession session = EvaluationSession.builder()
-                        // We implement the Bindings interface using a lambda. Bindings are used to map
-                        // names into values,
-                        // in this case we are binding the data from the S3 bucket into the
-                        // "myS3Document" name
-                        .globals(
-                                        Bindings.<ExprValue>lazyBindingsBuilder()
-                                                        .addBinding("payload", () -> ExprValue.of(values))
-                                                        .build())
-                        .build();
+            // We implement the Bindings interface using a lambda. Bindings are used to map
+            // names into values,
+            // in this case we are binding the data from the S3 bucket into the
+            // "myS3Document" name
+            .globals(
+                Bindings.<ExprValue>lazyBindingsBuilder()
+                    .addBinding("payload", () -> ExprValue.of(values))
+                    .build())
+            .build();
 
         // Executes the query in the session that's encapsulating the JSON data
         final ExprValue selectAndFilterResult = selectAndFilter.eval(session);
