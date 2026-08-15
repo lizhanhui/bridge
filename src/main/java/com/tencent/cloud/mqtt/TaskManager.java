@@ -25,6 +25,12 @@ public class TaskManager {
     /** Default loop-prevention limit when a task does not set {@code max_hops}. */
     private static final int DEFAULT_MAX_HOPS = 1;
 
+    /** Default parallelism when a task does not set {@code parallelism}. */
+    private static final int DEFAULT_PARALLELISM = 1;
+
+    /** One lane of a task: a fully-named task ready for connector construction. */
+    record TaskSpec(String name, String sql, int maxHops, JsonNode source, JsonNode sink) {}
+
     public static void main(String[] args) throws IOException, InterruptedException {
         Path configPath = Path.of(args.length > 0 ? args[0] : DEFAULT_CONFIG_PATH);
         List<Task> tasks = loadTasks(configPath);
@@ -55,18 +61,41 @@ public class TaskManager {
         }
     }
 
+    /**
+     * Expands each task config into {@code parallelism} lane specs named
+     * {@code <name>-<seq>}. Pure: no connectors are resolved and no clients
+     * are built, so it is unit-testable without brokers.
+     */
+    static List<TaskSpec> expandTaskConfigs(JsonNode tasksNode) {
+        List<TaskSpec> specs = new ArrayList<>();
+        for (JsonNode taskNode : tasksNode) {
+            String name = taskNode.required("name").asText();
+            int parallelism = taskNode.path("parallelism").asInt(DEFAULT_PARALLELISM);
+            if (parallelism < 1) {
+                throw new IllegalArgumentException(
+                    "Task " + name + ": parallelism must be >= 1, got " + parallelism);
+            }
+            String sql = taskNode.required("sql").asText();
+            int maxHops = taskNode.path("max_hops").asInt(DEFAULT_MAX_HOPS);
+            JsonNode source = taskNode.required("source");
+            JsonNode sink = taskNode.required("sink");
+            for (int seq = 0; seq < parallelism; seq++) {
+                specs.add(new TaskSpec(name + "-" + seq, sql, maxHops, source, sink));
+            }
+        }
+        return specs;
+    }
+
     static List<Task> loadTasks(Path configPath) throws IOException {
         JsonNode root = new ObjectMapper().readTree(configPath.toFile());
         Map<String, Connector> connectors = parseConnectors(root.required("connectors"));
 
         List<Task> tasks = new ArrayList<>();
-        for (JsonNode taskNode : root.required("tasks")) {
-            String name = taskNode.required("name").asText();
-            Source source = parseSource(taskNode.required("source"), connectors, name);
-            Transform<String, String> transform = new SQLTransform<>(taskNode.required("sql").asText());
-            Sink sink = parseSink(taskNode.required("sink"), connectors, name);
-            int maxHops = taskNode.path("max_hops").asInt(DEFAULT_MAX_HOPS);
-            tasks.add(new Task(name, source, transform, sink, maxHops));
+        for (TaskSpec spec : expandTaskConfigs(root.required("tasks"))) {
+            Source source = parseSource(spec.source(), connectors, spec.name());
+            Transform<String, String> transform = new SQLTransform<>(spec.sql());
+            Sink sink = parseSink(spec.sink(), connectors, spec.name());
+            tasks.add(new Task(spec.name(), source, transform, sink, spec.maxHops()));
         }
         return tasks;
     }
