@@ -1,6 +1,9 @@
 package com.tencent.cloud.mqtt;
 
 import java.io.ByteArrayInputStream;
+import java.util.Optional;
+import org.apache.kafka.streams.processor.api.Record;
+
 import com.amazon.ion.IonDatagram;
 import com.amazon.ion.IonReader;
 import com.amazon.ion.IonSystem;
@@ -15,7 +18,7 @@ import org.partiql.lang.eval.ExprValue;
 import org.partiql.lang.eval.ExprValueExtensionsKt;
 import org.partiql.lang.eval.Expression;
 
-public class SQLTransform implements Transform {
+public class SQLTransform<K, V> implements Transform {
     private final String sql;
 
     public SQLTransform(String sql) {
@@ -26,7 +29,7 @@ public class SQLTransform implements Transform {
         return sql;
     }
 
-    void transform() throws Exception {
+    public Optional<Record<K, V>> transform(Record<K, V> record) throws Exception {
         String jsons = """
             {"id": "1", "name": "person_1", "age": 32, "address": "555 1st street, Seattle", "tags": []}
             {"id": "2", "name": "person_2", "age": 24}
@@ -85,5 +88,7 @@ public class SQLTransform implements Transform {
         // writer and dump the ExprValue
         // as any format you want.
         ExprValueExtensionsKt.toIonValue(selectAndFilterResult, ion).writeTo(resultWriter);
+
+        return Optional.empty();
     }
 }
