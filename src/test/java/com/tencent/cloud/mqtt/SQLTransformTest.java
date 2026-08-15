@@ -26,8 +26,10 @@ class SQLTransformTest {
     @Test
     void matchingRecordReturnsRowWithKeyAndTimestampPreserved() throws Exception {
         SQLTransform<String, String> transform = new SQLTransform<>(FILTER_SQL);
-        Record<String, String> input = new Record<>("key-1",
-            "{\"id\": \"3\", \"age\": 25, \"address\": {\"number\": 555, \"street\": \"1st street\"}}", 42L);
+        String json = """
+            {"id": "3", "age": 25, "address": {"number": 555, "street": "1st street"}}
+            """;
+        Record<String, String> input = new Record<>("key-1", json, 42L);
 
         Optional<List<Record<String, String>>> result = transform.transform(input);
 
@@ -42,7 +44,10 @@ class SQLTransformTest {
     @Test
     void nonMatchingRecordIsFilteredOut() {
         SQLTransform<String, String> transform = new SQLTransform<>(FILTER_SQL);
-        Record<String, String> input = new Record<>("key-1", "{\"id\": \"1\", \"age\": 32}", 42L);
+        String json = """
+            {"id": "1", "age": 32}
+            """;
+        Record<String, String> input = new Record<>("key-1", json, 42L);
 
         assertTrue(transform.transform(input).isEmpty());
     }
@@ -59,22 +64,29 @@ class SQLTransformTest {
     void projectionReturnsOnlySelectedFields() throws Exception {
         SQLTransform<String, String> transform = new SQLTransform<>(
             "SELECT payload.name, payload.age FROM payload WHERE payload.age < 30");
-        Record<String, String> input = new Record<>("key-1",
-            "{\"name\": \"person_2\", \"age\": 24, \"address\": \"555 1st street\"}", 42L);
+        String json = """
+            {"name": "person_2", "age": 24, "address": "555 1st street"}
+            """;
+        Record<String, String> input = new Record<>("key-1", json, 42L);
 
         Optional<List<Record<String, String>>> result = transform.transform(input);
 
         assertTrue(result.isPresent());
         assertEquals(1, result.get().size());
-        assertEquals(json("{\"name\": \"person_2\", \"age\": 24}"), json(result.get().get(0).value()));
+        String expected = """
+            {"name": "person_2", "age": 24}
+            """;
+        assertEquals(json(expected), json(result.get().getFirst().value()));
     }
 
     @Test
     void unnestProducesOneRecordPerRow() {
         SQLTransform<String, String> transform = new SQLTransform<>(
             "SELECT VALUE t FROM payload.tags AS t");
-        Record<String, String> input = new Record<>("key-1",
-            "{\"id\": \"3\", \"tags\": [\"premium_user\", \"beta_tester\"]}", 42L);
+        String json = """
+            {"id": "3", "tags": ["premium_user", "beta_tester"]}
+            """;
+        Record<String, String> input = new Record<>("key-1", json, 42L);
 
         Optional<List<Record<String, String>>> result = transform.transform(input);
 
