@@ -1,6 +1,8 @@
 package com.tencent.cloud.mqtt;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Optional;
 
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.streams.processor.api.Record;
@@ -9,6 +11,12 @@ import org.slf4j.LoggerFactory;
 
 public class Task {
     private static final Logger log = LoggerFactory.getLogger(Task.class);
+
+    /** First sink-retry delay after a recoverable publish failure. */
+    static final long INITIAL_RETRY_DELAY_MILLIS = 1_000;
+
+    /** Maximum sink-retry delay; retries continue indefinitely at this interval. */
+    static final long MAX_RETRY_DELAY_MILLIS = 60_000;
 
     /**
      * Loop-prevention header: incremented on every pass through this bridge.
@@ -44,11 +52,11 @@ public class Task {
     /**
      * Crash-safety contract: a polled record is acked at the source only once
      * it is fully processed — filtered out by the transform, dropped by the
-     * max_hops check, or after every generated result record has been
-     * published to the sink ({@link Sink#publish} is blocking and fail-fast,
-     * so reaching the ack means the sink durably processed all results).
-     * A record whose processing dies mid-flight stays unacked and is
-     * redelivered by the broker after restart.
+     * max_hops check, skipped as poison by the sink, or after every generated
+     * result record has been published to the sink. Recoverable sink failures
+     * are retried with backoff before acknowledgement (see
+     * {@link #publishWithRetry}); a record still retrying when the process
+     * dies stays unacked and is redelivered by the broker after restart.
      */
     public void launch() throws InterruptedException {
         log.info("Task {} started", name);
@@ -63,8 +71,14 @@ public class Task {
                     continue;
                 }
                 setHopCount(record, hopCount + 1);
-                transform.transform(record)
-                    .ifPresent(records -> records.forEach(sink::publish));
+                Optional<List<Record<String, String>>> transformed = transform.transform(record);
+                if (transformed.isPresent()) {
+                    for (Record<String, String> result : transformed.get()) {
+                        if (!publishWithRetry(result)) {
+                            break;
+                        }
+                    }
+                }
                 record.ack();
             }
         } finally {
@@ -75,6 +89,41 @@ public class Task {
             }
             log.info("Task {} stopped", name);
         }
+    }
+
+    /**
+     * Publishes one transformed record. Recoverable sink failures are retried
+     * indefinitely with exponential backoff. A poison failure cannot succeed by
+     * retrying, so it and the remaining rows from the same source record are
+     * skipped; returning false lets the caller acknowledge the source record.
+     */
+    private boolean publishWithRetry(Record<String, String> record) throws InterruptedException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                sink.publish(record);
+                return true;
+            } catch (RuntimeException e) {
+                if (isPoisonSinkFailure(e)) {
+                    log.warn("Task {} skipping record after non-retryable sink failure", name, e);
+                    return false;
+                }
+                long delay = retryDelayMillis(attempt);
+                log.warn("Task {} sink publish failed; retrying in {} ms", name, delay, e);
+                Thread.sleep(delay);
+            }
+        }
+    }
+
+    /** Conservative poison classification: argument validation failures cannot be fixed by retrying. */
+    static boolean isPoisonSinkFailure(RuntimeException failure) {
+        return failure instanceof IllegalArgumentException;
+    }
+
+    /** Delay before sink retry number {@code retry}, doubling from 1s and capped at 60s. */
+    static long retryDelayMillis(int retry) {
+        int shift = Math.min(Math.max(retry - 1, 0), 31);
+        long delay = INITIAL_RETRY_DELAY_MILLIS << shift;
+        return Math.min(delay, MAX_RETRY_DELAY_MILLIS);
     }
 
     private static int hopCount(Record<String, String> record) {

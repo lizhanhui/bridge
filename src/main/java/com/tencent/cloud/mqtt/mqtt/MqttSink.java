@@ -10,7 +10,7 @@ import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import com.tencent.cloud.mqtt.Sink;
 import com.tencent.cloud.mqtt.model.Connector;
 
-/** Publishes records to a fixed MQTT topic. Fail-fast: publish errors propagate and kill the task. */
+/** Publishes records to a fixed MQTT topic. Publish errors propagate; Task decides retry vs. poison-skip. */
 public class MqttSink implements Sink {
     private static final Logger log = LoggerFactory.getLogger(MqttSink.class);
 

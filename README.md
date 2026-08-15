@@ -451,10 +451,17 @@ The bridge is designed for at-least-once processing on acknowledgement-capable p
 - The source is not acknowledged before transformation.
 - Filtered records are acknowledged.
 - Multi-row results are acknowledged only after every output is published.
-- A sink failure leaves the source record unacknowledged for broker redelivery.
+- A recoverable sink failure is retried indefinitely before acknowledgement; the source record remains unacknowledged while retries continue.
+- A sink validation failure (`IllegalArgumentException`) is treated as a poison record: the failing output and remaining outputs from that source record are skipped, a warning is logged, and the source record is acknowledged.
 - Source acknowledgements are idempotent within one process.
 
-This design allows duplicates. For example, if two output rows are published and the third publish fails, the unacknowledged source record can be redelivered and all rows generated again. Sink consumers should therefore be idempotent when duplicate delivery matters.
+This design allows duplicates. For example:
+
+- If two output rows are published and the third publish keeps failing, the unacknowledged source record can be redelivered and all rows generated again.
+- If `sink.publish` throws after the broker already accepted the message (for example, a client-side timeout or connection drop), the in-process retry republishes the message, producing a duplicate at the sink without any redelivery.
+- On RocketMQ sources, a lane still retrying past the 30-second invisible duration lets another lane in the same consumer group receive and process the same message concurrently; both lanes eventually ack.
+
+Sink consumers should therefore be idempotent when duplicate delivery matters.
 
 Important boundaries:
 
@@ -525,9 +532,14 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 
 ## Operations and failure behavior
 
-### Fail-fast lanes
+### Sink retries
 
-Source, transformation, and sink failures terminate the affected lane. `TaskManager` logs the error but does not restart the lane or terminate the process. A process can therefore remain alive after one or all lanes have stopped. External monitoring must inspect logs and message flow; process liveness alone is insufficient.
+When `sink.publish` fails, `Task` classifies the failure:
+
+- Most runtime failures are treated as recoverable. The same output is retried indefinitely with exponential backoff: 1, 2, 4, 8, 16, 32, then 60 seconds between attempts. Interrupting the lane stops the retry loop.
+- `IllegalArgumentException` is treated as a poison record because retrying an invalid destination or message will not help. The failing output and any remaining outputs from the same source record are skipped with a warning, and the source record is acknowledged.
+
+Retries occur before source acknowledgement, so broker redelivery remains the fallback if the process stops while retrying. A source, transformation, or acknowledgement failure still terminates the affected lane; `TaskManager` logs the error but does not restart the lane or terminate the process. External monitoring must inspect logs and message flow; process liveness alone is insufficient.
 
 ### Backpressure
 
@@ -537,7 +549,7 @@ RocketMQ receives one message at a time per lane and does not use the MQTT queue
 
 ### Shutdown
 
-On shutdown, all lane threads are interrupted. Each lane then attempts to close its source followed by its sink. The shutdown hook does not wait for cleanup, so allow the process an external termination grace period and do not assume every close operation completes.
+On shutdown, all lane threads are interrupted. Interrupting a lane also interrupts any in-progress sink retry backoff. Each lane then attempts to close its source followed by its sink. The shutdown hook does not wait for cleanup, so allow the process an external termination grace period and do not assume every close operation completes.
 
 ### Logging
 
@@ -588,7 +600,7 @@ Read [docs/issues.md](docs/issues.md) before production use. Current rollout blo
 
 - Plaintext credentials in checked-in sample configurations.
 - Source-controlled topic headers can override configured sink topics.
-- Failed lanes are not restarted and do not fail the process.
+- Failed lanes are not restarted and do not fail the process; recoverable sink publication failures are retried, but other lane failures still terminate the lane.
 - MQTT queue saturation can stall inflight delivery.
 - RocketMQ's 30-second invisibility period is fixed and not renewed.
 - MQTT QoS 0 is outside the at-least-once guarantee.

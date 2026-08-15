@@ -12,7 +12,7 @@ import org.slf4j.LoggerFactory;
 import com.tencent.cloud.mqtt.Sink;
 import com.tencent.cloud.mqtt.model.Connector;
 
-/** Publishes records to a fixed RocketMQ topic. Fail-fast: send errors propagate and kill the task. */
+/** Publishes records to a fixed RocketMQ topic. Send errors propagate; Task decides retry vs. poison-skip. */
 public class RocketMQSink implements Sink {
     private static final Logger log = LoggerFactory.getLogger(RocketMQSink.class);
 

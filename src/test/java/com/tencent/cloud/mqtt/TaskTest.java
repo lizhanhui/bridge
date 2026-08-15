@@ -1,6 +1,7 @@
 package com.tencent.cloud.mqtt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -62,9 +63,11 @@ class TaskTest {
 
     static class FakeSink implements Sink {
         final List<Record<String, String>> published = new CopyOnWriteArrayList<>();
+        final AtomicInteger publishAttempts = new AtomicInteger();
+        final AtomicInteger recoverableFailures = new AtomicInteger();
         private final List<String> events;
         volatile boolean closed;
-        volatile boolean failOnPublish;
+        volatile RuntimeException failWith;
 
         FakeSink() {
             this(null);
@@ -76,8 +79,12 @@ class TaskTest {
 
         @Override
         public void publish(Record<String, String> record) {
-            if (failOnPublish) {
-                throw new RuntimeException("publish failed");
+            publishAttempts.incrementAndGet();
+            if (failWith != null) {
+                throw failWith;
+            }
+            if (recoverableFailures.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                throw new RuntimeException("transient publish failure");
             }
             published.add(record);
             if (events != null) {
@@ -155,19 +162,115 @@ class TaskTest {
     }
 
     @Test
-    void recordIsNotAckedWhenSinkThrows() throws Exception {
+    void recoverableSinkFailureIsRetriedUntilPublishSucceeds() throws Exception {
         FakeSource source = new FakeSource();
         TestAckableRecord record = new TestAckableRecord(new Record<>("k", "{}", 1L));
         source.records.add(record);
         FakeSink sink = new FakeSink();
-        sink.failOnPublish = true;
+        sink.recoverableFailures.set(2);
         Task task = new Task("t", source, r -> Optional.of(List.of(r)), sink, 1);
 
         Thread thread = startTask(task);
-        thread.join(); // task dies on the publish failure
+        waitFor(() -> record.ackCount.get() == 1);
+        thread.interrupt();
+        thread.join();
+
+        assertEquals(1, sink.published.size());
+        assertEquals(3, sink.publishAttempts.get());
+        assertEquals(1, record.ackCount.get());
+    }
+
+    @Test
+    void interruptDuringRetryBackoffStopsTaskWithoutAcking() throws Exception {
+        FakeSource source = new FakeSource();
+        TestAckableRecord record = new TestAckableRecord(new Record<>("k", "{}", 1L));
+        source.records.add(record);
+        FakeSink sink = new FakeSink();
+        sink.recoverableFailures.set(Integer.MAX_VALUE); // never recovers
+        Task task = new Task("t", source, r -> Optional.of(List.of(r)), sink, 1);
+
+        Thread thread = startTask(task);
+        waitFor(() -> sink.publishAttempts.get() >= 1); // now in the 1s backoff sleep
+        thread.interrupt();
+        thread.join(5000);
+
+        assertFalse(thread.isAlive(), "interrupt during backoff should stop the task");
+        assertEquals(0, record.ackCount.get());
+        assertTrue(source.closed);
+        assertTrue(sink.closed);
+    }
+
+    @Test
+    void poisonFailureSkipsRemainingRowsButAcksSource() throws Exception {
+        FakeSource source = new FakeSource();
+        TestAckableRecord record = new TestAckableRecord(new Record<>("k", "{}", 1L));
+        source.records.add(record);
+        FakeSink sink = new FakeSink() {
+            @Override
+            public void publish(Record<String, String> r) {
+                publishAttempts.incrementAndGet();
+                if ("poison".equals(r.value())) {
+                    throw new IllegalArgumentException("bad row");
+                }
+                published.add(r);
+            }
+        };
+        Task task = new Task("t", source,
+            r -> Optional.of(List.of(
+                new Record<>("k", "a", 1L),
+                new Record<>("k", "poison", 1L),
+                new Record<>("k", "b", 1L))),
+            sink, 1);
+
+        Thread thread = startTask(task);
+        waitFor(() -> record.ackCount.get() == 1);
+        thread.interrupt();
+        thread.join();
+
+        // row 1 published; row 2 poisoned; row 3 skipped (break, not continue)
+        assertEquals(1, sink.published.size());
+        assertEquals("a", sink.published.get(0).value());
+        assertEquals(2, sink.publishAttempts.get());
+        assertEquals(1, record.ackCount.get());
+    }
+
+    @Test
+    void poisonSinkFailureIsSkippedAndAcked() throws Exception {
+        FakeSource source = new FakeSource();
+        TestAckableRecord record = new TestAckableRecord(new Record<>("k", "{}", 1L));
+        source.records.add(record);
+        FakeSink sink = new FakeSink();
+        sink.failWith = new IllegalArgumentException("invalid destination");
+        Task task = new Task("t", source, r -> Optional.of(List.of(r)), sink, 1);
+
+        Thread thread = startTask(task);
+        waitFor(() -> record.ackCount.get() == 1);
+        thread.interrupt();
+        thread.join();
 
         assertTrue(sink.published.isEmpty());
-        assertEquals(0, record.ackCount.get());
+        assertEquals(1, sink.publishAttempts.get());
+        assertEquals(1, record.ackCount.get());
+        assertTrue(source.closed);
+        assertTrue(sink.closed);
+    }
+
+    @Test
+    void retryBackoffDoublesUntilSixtySeconds() {
+        assertEquals(1_000, Task.retryDelayMillis(1));
+        assertEquals(2_000, Task.retryDelayMillis(2));
+        assertEquals(4_000, Task.retryDelayMillis(3));
+        assertEquals(8_000, Task.retryDelayMillis(4));
+        assertEquals(16_000, Task.retryDelayMillis(5));
+        assertEquals(32_000, Task.retryDelayMillis(6));
+        assertEquals(60_000, Task.retryDelayMillis(7));
+        assertEquals(60_000, Task.retryDelayMillis(100));
+    }
+
+    @Test
+    void onlyInvalidArgumentFailuresArePoison() {
+        assertTrue(Task.isPoisonSinkFailure(new IllegalArgumentException("bad record")));
+        assertFalse(Task.isPoisonSinkFailure(new RuntimeException("broker unavailable")));
     }
 
     @Test

@@ -45,19 +45,23 @@ Required remediation:
 
 ### 3. Processing failures permanently terminate a task lane
 
-Locations:
+Status: **partially fixed**. Recoverable sink publication failures now retry indefinitely with exponential backoff from 1 second to 60 seconds, and sink validation failures are treated as poison records, skipped with a warning, and acknowledged. Source, transform, and acknowledgement failures still terminate a lane permanently.
 
-- `src/main/java/com/tencent/cloud/mqtt/Task.java:56-68`
-- `src/main/java/com/tencent/cloud/mqtt/TaskManager.java:45-53`
+Current locations:
 
-Mapper, transform, sink, and acknowledgement exceptions can escape the processing loop. `TaskManager` logs and swallows the failure, leaving the process alive with reduced or zero processing capacity.
+- Sink retry and poison handling: `src/main/java/com/tencent/cloud/mqtt/Task.java:74-127`
+- Lane error logging without restart: `src/main/java/com/tencent/cloud/mqtt/TaskManager.java:45-53`
+
+Remaining risk: source, transform, and acknowledgement exceptions can escape the processing loop. `TaskManager` logs and swallows those failures, leaving the process alive with reduced or zero processing capacity.
 
 Required remediation:
 
 - Either terminate the process with a non-zero status so an external supervisor restarts it, or implement bounded lane restart with backoff.
 - Expose lane health.
-- Define a poison-message retry and DLQ/quarantine policy.
+- Route poison records to a DLQ/quarantine instead of only logging and acknowledging them.
 - Test manager behavior after a lane fails.
+
+Known gap in the new classification: `RocketMQSink` wraps every `ClientException` — including client-side validation failures such as a bad topic from an `rmq.topic` header override — in a plain `RuntimeException` (`src/main/java/com/tencent/cloud/mqtt/rocketmq/RocketMQSink.java:35-38`). Such records are retried forever, head-of-line blocking the lane at a 60-second cadence. Broker-side rejections (e.g. not-authorized) on either sink have the same exposure. Operators should alert on repeated `sink publish failed; retrying` warnings. Consider unwrapping causes in `isPoisonSinkFailure` or adding a max-retry/DLQ policy.
 
 ### 4. MQTT queue saturation can exhaust inflight delivery
 
