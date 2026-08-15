@@ -4,8 +4,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -69,6 +71,7 @@ public class TaskManager {
      */
     static List<TaskSpec> expandTaskConfigs(JsonNode tasksNode) {
         List<TaskSpec> specs = new ArrayList<>();
+        Set<String> laneNames = new HashSet<>();
         for (JsonNode taskNode : tasksNode) {
             String name = taskNode.required("name").asText();
             int parallelism = taskNode.path("parallelism").asInt(DEFAULT_PARALLELISM);
@@ -81,7 +84,11 @@ public class TaskManager {
             JsonNode source = taskNode.required("source");
             JsonNode sink = taskNode.required("sink");
             for (int seq = 0; seq < parallelism; seq++) {
-                specs.add(new TaskSpec(name + "-" + seq, sql, maxHops, parallelism, source, sink));
+                String laneName = name + "-" + seq;
+                if (!laneNames.add(laneName)) {
+                    throw new IllegalArgumentException("Duplicate lane name: " + laneName);
+                }
+                specs.add(new TaskSpec(laneName, sql, maxHops, parallelism, source, sink));
             }
         }
         return specs;

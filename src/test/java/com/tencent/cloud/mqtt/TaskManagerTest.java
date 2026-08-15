@@ -2,6 +2,7 @@ package com.tencent.cloud.mqtt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 
@@ -58,9 +59,21 @@ class TaskManagerTest {
     void rejectsParallelismBelowOne() throws Exception {
         for (String bad : new String[] {"0", "-2"}) {
             JsonNode node = tasksNode("[" + taskJson("t", bad) + "]");
-            assertThrows(IllegalArgumentException.class,
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> TaskManager.expandTaskConfigs(node));
+            assertTrue(e.getMessage().contains("t"),
+                "message should name the offending task: " + e.getMessage());
         }
+    }
+
+    @Test
+    void rejectsDuplicateLaneNames() throws Exception {
+        JsonNode node = tasksNode(
+            "[" + taskJson("t", "2") + ", " + taskJson("t-0", null) + "]");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> TaskManager.expandTaskConfigs(node));
+        assertTrue(e.getMessage().contains("t-0"),
+            "message should name the duplicate lane: " + e.getMessage());
     }
 
     @Test
