@@ -1,5 +1,10 @@
 package com.tencent.cloud.mqtt;
 
-public interface Sink {
+import org.apache.kafka.streams.processor.api.Record;
 
+public interface Sink extends AutoCloseable {
+    void publish(Record<String, String> record);
+
+    @Override
+    void close();
 }

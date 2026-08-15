@@ -1,5 +1,6 @@
 package com.tencent.cloud.mqtt;
 
+import org.apache.kafka.streams.processor.api.Record;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,11 +11,11 @@ public class Task {
 
     private final Source source;
 
-    private final Transform transform;
+    private final Transform<String, String> transform;
 
     private final Sink sink;
 
-    public Task(String name, Source source, Transform transform, Sink sink) {
+    public Task(String name, Source source, Transform<String, String> transform, Sink sink) {
         this.name = name;
         this.source = source;
         this.transform = transform;
@@ -26,9 +27,17 @@ public class Task {
     }
 
     public void launch() throws InterruptedException {
-        // TODO: wire source -> transform -> sink message flow
         log.info("Task {} started", name);
-        Thread.sleep(Long.MAX_VALUE);
+        try {
+            Record<String, String> record;
+            while ((record = source.poll()) != null) {
+                transform.transform(record)
+                    .ifPresent(records -> records.forEach(sink::publish));
+            }
+        } finally {
+            source.close();
+            sink.close();
+            log.info("Task {} stopped", name);
+        }
     }
-
 }

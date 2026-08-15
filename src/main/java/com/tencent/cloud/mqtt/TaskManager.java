@@ -14,10 +14,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
-import com.tencent.cloud.mqtt.model.MqttSink;
-import com.tencent.cloud.mqtt.model.MqttSource;
-import com.tencent.cloud.mqtt.model.RocketMQSink;
-import com.tencent.cloud.mqtt.model.RocketMQSource;
 
 public class TaskManager {
     private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
@@ -84,23 +80,11 @@ public class TaskManager {
     }
 
     private static Source parseSource(JsonNode node, Map<String, Connector> connectors) {
-        Connector connector = resolveConnector(node, connectors);
-        return switch (connector.getType()) {
-            case MQTT -> new MqttSource(connector, node.required("topic_filter").asText());
-            case RocketMQ -> {
-                List<String> topics = new ArrayList<>();
-                node.required("topics").forEach(topic -> topics.add(topic.asText()));
-                yield new RocketMQSource(connector, node.required("consumerGroup").asText(), topics);
-            }
-        };
+        throw new UnsupportedOperationException("not yet implemented");
     }
 
     private static Sink parseSink(JsonNode node, Map<String, Connector> connectors) {
-        Connector connector = resolveConnector(node, connectors);
-        return switch (connector.getType()) {
-            case MQTT -> new MqttSink(connector, node.required("topic").asText());
-            case RocketMQ -> new RocketMQSink(connector, node.required("topic").asText());
-        };
+        throw new UnsupportedOperationException("not yet implemented");
     }
 
     private static Connector resolveConnector(JsonNode node, Map<String, Connector> connectors) {
