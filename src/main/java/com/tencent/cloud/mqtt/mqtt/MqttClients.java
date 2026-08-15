@@ -1,8 +1,10 @@
 package com.tencent.cloud.mqtt.mqtt;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
 
 import com.hivemq.client.mqtt.MqttClient;
+import com.hivemq.client.mqtt.lifecycle.MqttClientAutoReconnect;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5ClientBuilder;
 import com.tencent.cloud.mqtt.model.Connector;
@@ -44,7 +46,11 @@ final class MqttClients {
             .useMqttVersion5()
             .identifier(sanitizeIdentifier("bridge-" + connector.getId() + "-" + clientIdSuffix))
             .serverHost(hp.host())
-            .serverPort(hp.port());
+                .serverPort(hp.port())
+                .automaticReconnect(MqttClientAutoReconnect.builder()
+                        .initialDelay(1, TimeUnit.SECONDS)
+                        .maxDelay(120, TimeUnit.SECONDS)
+                        .build());
         if (hp.ssl()) {
             builder = builder.sslWithDefaultConfig();
         }
