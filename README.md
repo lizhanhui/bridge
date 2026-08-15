@@ -9,7 +9,7 @@ Supported flows:
 - MQTT → MQTT
 - RocketMQ → RocketMQ
 
-> **Production status:** this project is still early-stage and is not currently recommended for production rollout. Review [docs/issues.md](docs/issues.md) before deploying it with real traffic. In particular, replace and rotate the credentials in the checked-in sample configuration; never commit real credentials.
+> **Production status:** early-stage. The publish-before-ack pipeline is unit-tested, and sink failures are retried with exponential backoff, but this project has not been run against live brokers in a broker-backed integration test suite and is not yet recommended for production rollout. Review [docs/issues.md](docs/issues.md) before deploying it with real traffic. The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
 
 ## Table of contents
 
@@ -128,7 +128,7 @@ The JAR's main class is `com.tencent.cloud.mqtt.TaskManager`.
 
 ### 2. Create a configuration
 
-Start from `conf/tasks.json`, but replace every endpoint and credential. Do not use or commit the sample credentials.
+Start from `conf/tasks.json` and replace every `<...>` placeholder with real endpoints and credentials. Never commit the filled-in configuration.
 
 A minimal MQTT-to-RocketMQ configuration is:
 
@@ -598,7 +598,6 @@ The current test suite covers task processing, configuration expansion, PartiQL 
 
 Read [docs/issues.md](docs/issues.md) before production use. Current rollout blockers and notable limitations include:
 
-- Plaintext credentials in checked-in sample configurations.
 - Source-controlled topic headers can override configured sink topics.
 - Failed lanes are not restarted and do not fail the process; recoverable sink publication failures are retried, but other lane failures still terminate the lane.
 - MQTT queue saturation can stall inflight delivery.

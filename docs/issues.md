@@ -8,19 +8,15 @@ Current rollout verdict: **No-go for production**
 
 ### 1. Plaintext broker credentials are tracked
 
-Locations:
+Status: **partially fixed**. The checked-in configs now contain template placeholders (`<mqtt-username>`, `<mqtt-password>`, etc.) instead of real-looking credentials and endpoints.
 
-- `conf/tasks.json:4-16`
-- `conf/tasks-mqtt-only.json:4-8`
+The previously committed credentials remain in git history and must still be treated as compromised.
 
-The repository contains MQTT and RocketMQ credentials, including credentials for a publicly named MQTT endpoint. Git history retains these values after normal removal.
+Remaining remediation:
 
-Required remediation:
-
-- Rotate the credentials and treat existing values as compromised.
-- Replace tracked values with placeholders.
-- Load secrets from environment variables, mounted files, or a secret manager.
-- Purge exposed secrets from history where appropriate.
+- Rotate the credentials that were previously committed.
+- Purge exposed secrets from history where appropriate (e.g. history rewrite or repository rotation).
+- Load real secrets from environment variables, mounted files, or a secret manager at runtime — the current config format has no interpolation.
 - Add secret scanning to CI.
 
 ### 2. Message properties can override configured sink topics
