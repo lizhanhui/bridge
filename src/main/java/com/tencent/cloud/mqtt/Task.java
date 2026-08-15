@@ -35,8 +35,11 @@ public class Task {
                     .ifPresent(records -> records.forEach(sink::publish));
             }
         } finally {
-            source.close();
-            sink.close();
+            try {
+                source.close();
+            } finally {
+                sink.close();
+            }
             log.info("Task {} stopped", name);
         }
     }

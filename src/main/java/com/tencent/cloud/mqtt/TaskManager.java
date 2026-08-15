@@ -14,6 +14,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
+import com.tencent.cloud.mqtt.mqtt.MqttSink;
+import com.tencent.cloud.mqtt.mqtt.MqttSource;
 
 public class TaskManager {
     private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
@@ -58,7 +60,7 @@ public class TaskManager {
         for (JsonNode taskNode : root.required("tasks")) {
             String name = taskNode.required("name").asText();
             Source source = parseSource(taskNode.required("source"), connectors);
-            Transform transform = new SQLTransform(taskNode.required("sql").asText());
+            Transform<String, String> transform = new SQLTransform<>(taskNode.required("sql").asText());
             Sink sink = parseSink(taskNode.required("sink"), connectors);
             tasks.add(new Task(name, source, transform, sink));
         }
@@ -80,11 +82,19 @@ public class TaskManager {
     }
 
     private static Source parseSource(JsonNode node, Map<String, Connector> connectors) {
-        throw new UnsupportedOperationException("not yet implemented");
+        Connector connector = resolveConnector(node, connectors);
+        return switch (connector.getType()) {
+            case MQTT -> new MqttSource(connector, node.required("topic_filter").asText());
+            case RocketMQ -> throw new UnsupportedOperationException("RocketMQ source not yet implemented");
+        };
     }
 
     private static Sink parseSink(JsonNode node, Map<String, Connector> connectors) {
-        throw new UnsupportedOperationException("not yet implemented");
+        Connector connector = resolveConnector(node, connectors);
+        return switch (connector.getType()) {
+            case MQTT -> new MqttSink(connector, node.required("topic").asText());
+            case RocketMQ -> throw new UnsupportedOperationException("RocketMQ sink not yet implemented");
+        };
     }
 
     private static Connector resolveConnector(JsonNode node, Map<String, Connector> connectors) {

@@ -3,9 +3,9 @@ package com.tencent.cloud.mqtt;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 
 import org.apache.kafka.streams.processor.api.Record;
@@ -34,7 +34,7 @@ class TaskTest {
     }
 
     static class FakeSink implements Sink {
-        final List<Record<String, String>> published = new ArrayList<>();
+        final List<Record<String, String>> published = new CopyOnWriteArrayList<>();
         volatile boolean closed;
 
         @Override
