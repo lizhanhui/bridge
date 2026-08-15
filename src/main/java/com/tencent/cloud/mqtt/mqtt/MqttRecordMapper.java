@@ -50,6 +50,13 @@ public final class MqttRecordMapper {
     private MqttRecordMapper() {
     }
 
+    /**
+     * Maps an incoming publish to a record. The key is the value of the
+     * {@value #USER_PROPERTY_MESSAGE_ID} user property, or {@code null} when absent.
+     * User properties whose names collide with reserved {@code mqtt.*} headers are
+     * skipped (with a warning) so they cannot shadow the real protocol headers.
+     * Timestamp is receive time.
+     */
     public static Record<String, String> toRecord(Mqtt5Publish publish) {
         RecordHeaders headers = new RecordHeaders();
         headers.add(H_TOPIC, utf8(publish.getTopic().toString()));
@@ -74,6 +81,10 @@ public final class MqttRecordMapper {
         String key = null;
         for (Mqtt5UserProperty property : publish.getUserProperties().asList()) {
             String name = property.getName().toString();
+            if (RESERVED_HEADERS.contains(name)) {
+                log.warn("Skipping user property '{}': reserved record header name", name);
+                continue;
+            }
             String value = property.getValue().toString();
             headers.add(name, utf8(value));
             if (USER_PROPERTY_MESSAGE_ID.equals(name)) {
@@ -85,6 +96,14 @@ public final class MqttRecordMapper {
         return new Record<>(key, value, System.currentTimeMillis(), headers);
     }
 
+    /**
+     * Maps a record to an outgoing publish. Present headers override the configured
+     * defaults ({@code mqtt.topic} over {@code defaultTopic}, {@code mqtt.qos} over
+     * {@code defaultQos}, etc.); malformed or out-of-range header values log a warning
+     * and fall back to the default (or are skipped). Reserved {@code mqtt.*} headers are
+     * consumed as publish settings and {@value #BROKER_PROPERTY_PREFIX}-prefixed headers
+     * are dropped; every other header becomes a user property.
+     */
     public static Mqtt5Publish toPublish(Record<String, String> record, String defaultTopic,
             MqttQos defaultQos) {
         Headers headers = record.headers();
@@ -92,7 +111,7 @@ public final class MqttRecordMapper {
         Mqtt5PublishBuilder.Complete builder = Mqtt5Publish.builder()
             .topic(stringHeader(headers, H_TOPIC, defaultTopic))
             .qos(qosHeader(headers, defaultQos))
-            .retain("true".equals(stringHeader(headers, H_RETAINED, null)))
+            .retain(retainedHeader(headers))
             .payload(record.value().getBytes(StandardCharsets.UTF_8));
 
         String contentType = stringHeader(headers, H_CONTENT_TYPE, null);
@@ -100,7 +119,7 @@ public final class MqttRecordMapper {
             builder.contentType(contentType);
         }
         Header correlationData = header(headers, H_CORRELATION_DATA);
-        if (correlationData != null) {
+        if (correlationData != null && correlationData.value() != null) {
             builder.correlationData(ByteBuffer.wrap(correlationData.value()));
         }
         String responseTopic = stringHeader(headers, H_RESPONSE_TOPIC, null);
@@ -110,8 +129,10 @@ public final class MqttRecordMapper {
         String expiry = stringHeader(headers, H_MESSAGE_EXPIRY_INTERVAL, null);
         if (expiry != null) {
             try {
+                // IllegalArgumentException covers both non-numeric input
+                // (NumberFormatException) and values outside 0..4294967295
                 builder.messageExpiryInterval(Long.parseLong(expiry));
-            } catch (NumberFormatException e) {
+            } catch (IllegalArgumentException e) {
                 log.warn("Malformed {} header '{}', skipping", H_MESSAGE_EXPIRY_INTERVAL, expiry);
             }
         }
@@ -121,7 +142,8 @@ public final class MqttRecordMapper {
             boolean hasProps = false;
             for (Header header : headers) {
                 String name = header.key();
-                if (!RESERVED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)) {
+                if (!RESERVED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)
+                        && header.value() != null) {
                     propsBuilder.add(name, new String(header.value(), StandardCharsets.UTF_8));
                     hasProps = true;
                 }
@@ -132,6 +154,17 @@ public final class MqttRecordMapper {
         }
 
         return builder.build();
+    }
+
+    private static boolean retainedHeader(Headers headers) {
+        String value = stringHeader(headers, H_RETAINED, null);
+        if (value == null) {
+            return false;
+        }
+        if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) {
+            log.warn("Malformed {} header '{}', treating as false", H_RETAINED, value);
+        }
+        return "true".equalsIgnoreCase(value);
     }
 
     private static MqttQos qosHeader(Headers headers, MqttQos defaultQos) {
@@ -158,7 +191,9 @@ public final class MqttRecordMapper {
 
     private static String stringHeader(Headers headers, String name, String defaultValue) {
         Header header = header(headers, name);
-        return header == null ? defaultValue : new String(header.value(), StandardCharsets.UTF_8);
+        return header == null || header.value() == null
+            ? defaultValue
+            : new String(header.value(), StandardCharsets.UTF_8);
     }
 
     private static byte[] utf8(String s) {
