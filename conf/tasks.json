@@ -1,0 +1,33 @@
+{
+    "connectors": [
+        {
+            "id": "mqtt-1234",
+            "type": "MQTT",
+            "access_point": "mqtt://",
+            "username": "root",
+            "password": "password"
+        },
+
+        {
+            "id": "rmq-1234",
+            "type": "RocketMQ",
+            "access_point": "mqtt://",
+            "username": "root",
+            "password": "password"
+        }
+    ],
+    "tasks": [
+        {
+            "name": "task-name",
+            "source": {
+                "connector_id": "mqtt-1234",
+                "topic_filter": "$share/group-1/home/#"
+            },
+            "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "sink": {
+                "connector_id": "rmq-1234",
+                "topic": "home"
+            }
+        }
+    ]
+}
