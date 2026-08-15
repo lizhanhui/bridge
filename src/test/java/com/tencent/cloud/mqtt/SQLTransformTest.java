@@ -98,6 +98,30 @@ class SQLTransformTest {
     }
 
     @Test
+    void unnestedStructsProduceMultipleRows() throws Exception {
+        SQLTransform<String, String> transform = new SQLTransform<>(
+            "SELECT * FROM payload.readings AS r WHERE r.amount > 10");
+        String json = """
+            {"id": "sensor-1", "readings": [{"amount": 5}, {"amount": 20}, {"amount": 30}]}
+            """;
+        Record<String, String> input = new Record<>("key-1", json, 42L);
+
+        Optional<List<Record<String, String>>> result = transform.transform(input);
+
+        assertTrue(result.isPresent());
+        assertEquals(2, result.get().size());
+        String first = """
+            {"amount": 20}
+            """;
+        String second = """
+            {"amount": 30}
+            """;
+        assertEquals(json(first), json(result.get().get(0).value()));
+        assertEquals(json(second), json(result.get().get(1).value()));
+        assertTrue(result.get().stream().allMatch(r -> "key-1".equals(r.key()) && r.timestamp() == 42L));
+    }
+
+    @Test
     void invalidSqlFailsFastInConstructor() {
         assertThrows(RuntimeException.class, () -> new SQLTransform<>("SELECT FROM WHERE"));
     }
