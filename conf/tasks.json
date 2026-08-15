@@ -18,7 +18,7 @@
     ],
     "tasks": [
         {
-            "name": "task-name",
+            "name": "mqtt2rmq-task-name",
             "source": {
                 "connector_id": "mqtt-1234",
                 "topic_filter": "$share/group-1/home/#"
@@ -27,6 +27,22 @@
             "sink": {
                 "connector_id": "rmq-1234",
                 "topic": "home"
+            }
+        },
+        {
+            "name": "rmq2mqtt-task-name",
+            "source": {
+                "connector_id": "rmq-1234",
+                "consumerGroup": "Group-0",
+                "topics": [
+                    "home",
+                    "iov"
+                ]
+            },
+            "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "sink": {
+                "connector_id": "mqtt-1234",
+                "topic": "home/room/1"
             }
         }
     ]
