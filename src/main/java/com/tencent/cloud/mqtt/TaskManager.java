@@ -59,9 +59,9 @@ public class TaskManager {
         List<Task> tasks = new ArrayList<>();
         for (JsonNode taskNode : root.required("tasks")) {
             String name = taskNode.required("name").asText();
-            Source source = parseSource(taskNode.required("source"), connectors);
+            Source source = parseSource(taskNode.required("source"), connectors, name);
             Transform<String, String> transform = new SQLTransform<>(taskNode.required("sql").asText());
-            Sink sink = parseSink(taskNode.required("sink"), connectors);
+            Sink sink = parseSink(taskNode.required("sink"), connectors, name);
             tasks.add(new Task(name, source, transform, sink));
         }
         return tasks;
@@ -74,25 +74,27 @@ public class TaskManager {
             connector.setId(node.required("id").asText());
             connector.setType(ConnectorType.valueOf(node.required("type").asText()));
             connector.setAccessPoint(node.required("access_point").asText());
-            connector.setUsername(node.required("username").asText());
-            connector.setPassword(node.required("password").asText());
+            connector.setUsername(node.path("username").asText(null));
+            connector.setPassword(node.path("password").asText(null));
             connectors.put(connector.getId(), connector);
         }
         return connectors;
     }
 
-    private static Source parseSource(JsonNode node, Map<String, Connector> connectors) {
+    private static Source parseSource(JsonNode node, Map<String, Connector> connectors, String taskName) {
         Connector connector = resolveConnector(node, connectors);
         return switch (connector.getType()) {
-            case MQTT -> new MqttSource(connector, node.required("topic_filter").asText());
+            case MQTT -> new MqttSource(connector, node.required("topic_filter").asText(),
+                "source-" + taskName);
             case RocketMQ -> throw new UnsupportedOperationException("RocketMQ source not yet implemented");
         };
     }
 
-    private static Sink parseSink(JsonNode node, Map<String, Connector> connectors) {
+    private static Sink parseSink(JsonNode node, Map<String, Connector> connectors, String taskName) {
         Connector connector = resolveConnector(node, connectors);
         return switch (connector.getType()) {
-            case MQTT -> new MqttSink(connector, node.required("topic").asText());
+            case MQTT -> new MqttSink(connector, node.required("topic").asText(),
+                "sink-" + taskName);
             case RocketMQ -> throw new UnsupportedOperationException("RocketMQ sink not yet implemented");
         };
     }

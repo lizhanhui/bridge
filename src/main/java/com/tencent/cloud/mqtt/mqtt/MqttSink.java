@@ -17,21 +17,28 @@ public class MqttSink implements Sink {
 
     private final Mqtt5AsyncClient client;
     private final String topic;
+    private final String accessPoint;
 
-    public MqttSink(Connector connector, String topic) {
-        this.client = MqttClients.buildAsyncClient(connector, "sink");
+    public MqttSink(Connector connector, String topic, String clientIdSuffix) {
+        this.client = MqttClients.buildAsyncClient(connector, clientIdSuffix);
         this.topic = topic;
+        this.accessPoint = connector.getAccessPoint();
         client.toBlocking().connect();
-        log.info("MqttSink connected to {} for topic {}", connector.getAccessPoint(), topic);
+        log.info("MqttSink connected to {} for topic {}", accessPoint, topic);
     }
 
     @Override
     public void publish(Record<String, String> record) {
-        client.toBlocking().publishWith()
-            .topic(topic)
-            .qos(MqttQos.AT_LEAST_ONCE)
-            .payload(record.value().getBytes(StandardCharsets.UTF_8))
-            .send();
+        try {
+            client.toBlocking().publishWith()
+                .topic(topic)
+                .qos(MqttQos.AT_LEAST_ONCE)
+                .payload(record.value().getBytes(StandardCharsets.UTF_8))
+                .send();
+        } catch (RuntimeException e) {
+            log.error("Failed to publish to topic {} on {}", topic, accessPoint, e);
+            throw e;
+        }
     }
 
     @Override

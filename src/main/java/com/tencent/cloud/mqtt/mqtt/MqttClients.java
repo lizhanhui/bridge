@@ -33,11 +33,16 @@ final class MqttClients {
         return new HostPort(host, port, port == TLS_PORT);
     }
 
+    /** Keeps client IDs within a safe subset of MQTT's allowed UTF-8. */
+    private static String sanitizeIdentifier(String identifier) {
+        return identifier.replaceAll("[^A-Za-z0-9_-]", "-");
+    }
+
     static Mqtt5AsyncClient buildAsyncClient(Connector connector, String clientIdSuffix) {
         HostPort hp = parseAccessPoint(connector.getAccessPoint());
         Mqtt5ClientBuilder builder = MqttClient.builder()
             .useMqttVersion5()
-            .identifier("bridge-" + connector.getId() + "-" + clientIdSuffix)
+            .identifier(sanitizeIdentifier("bridge-" + connector.getId() + "-" + clientIdSuffix))
             .serverHost(hp.host())
             .serverPort(hp.port());
         if (hp.ssl()) {

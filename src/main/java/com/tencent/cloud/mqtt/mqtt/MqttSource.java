@@ -31,8 +31,8 @@ public class MqttSource implements Source {
         new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private volatile boolean closed;
 
-    public MqttSource(Connector connector, String topicFilter) {
-        this.client = MqttClients.buildAsyncClient(connector, "source");
+    public MqttSource(Connector connector, String topicFilter, String clientIdSuffix) {
+        this.client = MqttClients.buildAsyncClient(connector, clientIdSuffix);
         client.toBlocking().connect();
         try {
             client.toAsync().subscribeWith()
