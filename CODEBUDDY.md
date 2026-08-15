@@ -9,8 +9,9 @@ Early-stage Java (Maven) service that bridges MQTT brokers and RocketMQ: it cons
 ## Build & Run
 
 - Build: `mvn compile` (or `mvn package`)
-- Entry point: `com.tencent.cloud.mqtt.TaskManager` (currently an empty `main` — the pipeline wiring is in progress)
-- No tests or lint tooling are configured yet; `pom.xml` has no test dependencies or plugins
+- Entry point: `com.tencent.cloud.mqtt.TaskManager` — loads `conf/tasks.json` (or path from `args[0]`), builds connectors/tasks, runs each `Task` on its own virtual thread, with a shutdown hook that interrupts task threads
+- Tests: `mvn test` (JUnit 5 + Surefire); run a single test with `mvn test -Dtest=SQLTransformTest`
+- No lint tooling is configured yet
 - Compiler target is Java 25 — ensure the JDK matches before building
 - Run configuration is defined in `conf/tasks.json` (connectors + tasks)
 
@@ -19,10 +20,11 @@ Early-stage Java (Maven) service that bridges MQTT brokers and RocketMQ: it cons
 Data flow: **Source → Transform → Sink**, orchestrated per `Task`.
 
 - `com.tencent.cloud.mqtt` — core abstractions:
-  - `Source`, `Sink`, `Transform` — marker interfaces (no methods yet)
+  - `Source`, `Sink` — marker interfaces (no methods yet)
+  - `Transform<K, V>` — `Optional<List<Record<K, V>>> transform(Record<K, V>)` using Kafka Streams' `org.apache.kafka.streams.processor.api.Record`; empty = record filtered out
   - `Task` — a named Source/Transform/Sink triple with a `launch()` stub
-  - `TaskManager` — main entry point; will load `conf/tasks.json`, build connectors and tasks
-  - `SQLTransform` — working reference implementation of Transform using PartiQL (`partiql-lang-kotlin`) over JSON payloads. JSON is parsed via ion-java (Ion is a superset of JSON); the message payload is bound to the global name `payload`, so SQL in task configs reads `SELECT ... FROM payload WHERE ...`. Note its `transform()` is currently a hardcoded demo, not yet parameterized.
+  - `TaskManager` — main entry point; loads `conf/tasks.json`, builds connectors and tasks
+  - `SQLTransform<K, V>` — Transform implementation using PartiQL (`partiql-lang-kotlin`) over JSON payloads. The query is compiled once in the constructor and reused; JSON is parsed via ion-java (Ion is a superset of JSON); the record value (must be JSON text) is bound to the global name `payload`, so SQL in task configs reads `SELECT ... FROM payload WHERE ...`. Malformed JSON payloads are dropped (logged) and yield empty. Output records reuse the input key/timestamp/headers with each result row serialized back to JSON.
 - `com.tencent.cloud.mqtt.model` — config model POJOs mirroring `conf/tasks.json`:
   - `Connector` — connection credentials; `ConnectorType` enum is `MQTT` / `RocketMQ`
   - `MqttSource` (topic filter, supports MQTT shared subscriptions like `$share/group/...`), `MqttSink` (topic)
@@ -34,6 +36,8 @@ Data flow: **Source → Transform → Sink**, orchestrated per `Task`.
 
 - `hivemq-mqtt-client` — MQTT connectivity
 - `rocketmq-client` (5.5.0) — RocketMQ connectivity
+- `kafka-streams` (4.3.1) — only for its `processor.api.Record` type used as the transform input/output; no Kafka brokers are involved
 - `partiql-lang-kotlin` — SQL-over-JSON transformation engine
 - `kotlin-stdlib` (1.6.20) — required by PartiQL at runtime
-- `slf4j-api` — logging facade (no binding configured yet)
+- `jackson-databind` — parsing `conf/tasks.json`
+- `slf4j-api` + `slf4j-simple` (runtime binding) — logging
