@@ -1,6 +1,5 @@
 package com.tencent.cloud.mqtt.mqtt;
 
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -39,10 +38,7 @@ public class MqttSource implements Source {
                 .topicFilter(topicFilter)
                 .qos(MqttQos.AT_LEAST_ONCE)
                 .callback(publish -> {
-                    Record<String, String> record = new Record<>(
-                        publish.getTopic().toString(),
-                        new String(publish.getPayloadAsBytes(), StandardCharsets.UTF_8),
-                        System.currentTimeMillis());
+                    Record<String, String> record = MqttRecordMapper.toRecord(publish);
                     try {
                         if (!queue.offer(record, OFFER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                             log.error("Source queue full for {}s, dropping message from topic {}",

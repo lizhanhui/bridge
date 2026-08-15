@@ -1,13 +1,12 @@
 package com.tencent.cloud.mqtt.mqtt;
 
-import java.nio.charset.StandardCharsets;
-
 import org.apache.kafka.streams.processor.api.Record;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5AsyncClient;
+import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import com.tencent.cloud.mqtt.Sink;
 import com.tencent.cloud.mqtt.model.Connector;
 
@@ -30,11 +29,8 @@ public class MqttSink implements Sink {
     @Override
     public void publish(Record<String, String> record) {
         try {
-            client.toBlocking().publishWith()
-                .topic(topic)
-                .qos(MqttQos.AT_LEAST_ONCE)
-                .payload(record.value().getBytes(StandardCharsets.UTF_8))
-                .send();
+            Mqtt5Publish publish = MqttRecordMapper.toPublish(record, topic, MqttQos.AT_LEAST_ONCE);
+            client.toBlocking().publish(publish);
         } catch (RuntimeException e) {
             log.error("Failed to publish to topic {} on {}", topic, accessPoint, e);
             throw e;
