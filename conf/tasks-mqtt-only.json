@@ -1,0 +1,25 @@
+{
+    "connectors": [
+        {
+            "id": "mqtt-knbz9ga3",
+            "type": "MQTT",
+            "access_point": "mqtt-knbz9ga3-nj-public.mqtt.tencenttdmq.com:8883",
+            "username": "root",
+            "password": "P1ssw0rd"
+        }
+    ],
+    "tasks": [
+        {
+            "name": "mqtt2mqtt-task-name",
+            "source": {
+                "connector_id": "mqtt-knbz9ga3",
+                "topic_filter": "$share/group-1/home/#"
+            },
+            "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "sink": {
+                "connector_id": "mqtt-knbz9ga3",
+                "topic": "home/room/1"
+            }
+        }
+    ]
+}
