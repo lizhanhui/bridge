@@ -1,7 +1,7 @@
 # MQTT Source & Sink — Design
 
 Date: 2026-08-15
-Status: Approved
+Status: Approved (amended 2026-08-15: record/header mapping, see bottom section)
 
 ## Goal
 
@@ -93,3 +93,61 @@ Unit-test the `Task` pipeline loop with fake in-memory Source/Sink:
 
 No broker integration tests for now; manual verification against a real
 broker. hivemq-testcontainer can be added later if wanted.
+
+## Amendment (2026-08-15): MQTT ↔ Record header mapping
+
+Supersedes "key = MQTT topic, sink ignores key" above. Mapping follows the
+reference diagram (MQTT message ↔ Kafka record), with two corrections:
+topic maps to an `mqtt.topic` header (not the key), and the record key is the
+`$__messageId` user property. Property names verified against the broker
+source (/data/repo/rocketmq-mqtt): the `$__*` names are set by the broker as
+MQTT 5 user properties on outbound delivery
+(`mqtt-common/.../Constants.java:46-50`, `mqtt-cs/.../Session.java:937-963`);
+the `mqtt.*` names are bridge-side record-header conventions (not present in
+the broker).
+
+A shared `mqtt.MqttRecordMapper` holds both directions.
+
+### Source — `toRecord(Mqtt5Publish) → Record<String,String>`
+
+| MQTT field | Record |
+|---|---|
+| payload | value (UTF-8) |
+| topic | `mqtt.topic` header |
+| QoS | `mqtt.qos` header (`"0"/"1"/"2"`) |
+| retain flag | `mqtt.retained` header (`"true"/"false"`) |
+| dup flag | `mqtt.duplicate` header |
+| content type | `mqtt.content.type` (when present) |
+| correlation data | `mqtt.correlation.data` (raw bytes, when present) |
+| response topic | `mqtt.response.topic` (when present) |
+| message expiry | `mqtt.message.expiry.interval` (seconds, when present) |
+| every user property | header with the same name |
+| `$__messageId` user property | record **key** (null if absent) |
+
+`mqtt.message.packet.id` stays a defined constant but is never populated on
+subscribe (hivemq does not expose packet IDs for incoming publishes) and
+ignored on publish. Record timestamp stays receive-time. `SQLTransform`
+already preserves headers on output records, so headers flow through the
+transform untouched.
+
+### Sink — record headers override global config
+
+Reserved headers are consumed as publish settings, not re-published as user
+properties: `mqtt.topic` (overrides configured topic), `mqtt.qos` (overrides
+QoS 1), `mqtt.retained`, `mqtt.content.type`, `mqtt.correlation.data`,
+`mqtt.response.topic`, `mqtt.message.expiry.interval`.
+`mqtt.duplicate` and `mqtt.message.packet.id` are ignored (cannot be set
+client-side). `$__`-prefixed headers are **dropped** on publish — they are
+broker-assigned metadata and the broker sets fresh ones on delivery;
+re-publishing them would produce duplicates. Every other header becomes an
+MQTT user property (round-trip). Malformed header values (e.g. non-numeric
+`mqtt.qos`) log a warning and fall back to the configured default rather
+than failing the task.
+
+### Testing
+
+`MqttRecordMapperTest` (no broker needed — `Mqtt5Publish.builder()`
+constructs publishes directly): source direction (key from `$__messageId`,
+null when absent, all protocol/user-property headers), sink direction
+(topic/QoS overrides, defaults when headers absent, user-property
+round-trip, reserved + `$__*` exclusion, malformed-header fallback).
