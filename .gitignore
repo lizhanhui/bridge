@@ -41,3 +41,5 @@ build/
 
 .idea
 dependency-reduced-pom.xml
+### E2E ###
+e2e/classes/
