@@ -116,7 +116,7 @@ A shared `mqtt.MqttRecordMapper` holds both directions.
 | topic | `mqtt.topic` header |
 | QoS | `mqtt.qos` header (`"0"/"1"/"2"`) |
 | retain flag | `mqtt.retained` header (`"true"/"false"`) |
-| dup flag | `mqtt.duplicate` header |
+| dup flag | `mqtt.duplicate` header (see note) |
 | content type | `mqtt.content.type` (when present) |
 | correlation data | `mqtt.correlation.data` (raw bytes, when present) |
 | response topic | `mqtt.response.topic` (when present) |
@@ -126,9 +126,14 @@ A shared `mqtt.MqttRecordMapper` holds both directions.
 
 `mqtt.message.packet.id` stays a defined constant but is never populated on
 subscribe (hivemq does not expose packet IDs for incoming publishes) and
-ignored on publish. Record timestamp stays receive-time. `SQLTransform`
+ignored on publish. Likewise `mqtt.duplicate`: hivemq 1.3.17 exposes no dup
+flag on delivered publishes (it exists only on the internal
+`MqttStatefulPublish`), so the header is always `"false"` until the client
+library surfaces it. Record timestamp stays receive-time. `SQLTransform`
 already preserves headers on output records, so headers flow through the
-transform untouched.
+transform untouched. User properties whose names collide with reserved
+`mqtt.*` headers are skipped (logged) on the source side so they cannot
+shadow real protocol values.
 
 ### Sink — record headers override global config
 
