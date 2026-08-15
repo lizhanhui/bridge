@@ -19,6 +19,7 @@
     "tasks": [
         {
             "name": "mqtt2rmq-task-name",
+            "parallelism": 2,
             "source": {
                 "connector_id": "mqtt-knbz9ga3",
                 "topic_filter": "$share/group-1/home/#"

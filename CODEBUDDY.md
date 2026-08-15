@@ -30,7 +30,7 @@ Data flow: **Source → Transform → Sink**, orchestrated per `Task`.
   - `MqttSource` (topic filter, supports MQTT shared subscriptions like `$share/group/...`), `MqttSink` (topic)
   - `RocketMQSource` (consumer group + topic list), `RocketMQSink` (topic)
 
-`conf/tasks.json` schema: a `connectors` array (id/type/access_point/username/password) and a `tasks` array; each task references connectors by `connector_id`, carries a `sql` PartiQL statement executed against the incoming payload, and may set `max_hops` (loop-prevention limit, default 1).
+`conf/tasks.json` schema: a `connectors` array (id/type/access_point/username/password) and a `tasks` array; each task references connectors by `connector_id`, carries a `sql` PartiQL statement executed against the incoming payload, and may set `max_hops` (loop-prevention limit, default 1). A task may also set `parallelism` (optional int ≥ 1, default 1): the task then runs as N independent lanes named `<name>-<seq>`, each with its own source/transform/sink and clients; MQTT source lanes need a `$share/` filter to split load, otherwise every lane receives every message.
 
 ## Key dependencies
 
