@@ -11,7 +11,7 @@
         {
             "id": "rmq-1234",
             "type": "RocketMQ",
-            "access_point": "mqtt://",
+            "access_point": "127.0.0.1:8081",
             "username": "root",
             "password": "password"
         }
@@ -35,7 +35,7 @@
             "name": "rmq2mqtt-task-name",
             "source": {
                 "connector_id": "rmq-1234",
-                "consumerGroup": "Group-0",
+                "consumer_group": "Group-0",
                 "topics": [
                     "home",
                     "iov"

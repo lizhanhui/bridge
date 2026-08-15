@@ -18,6 +18,8 @@ import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
 import com.tencent.cloud.mqtt.mqtt.MqttSink;
 import com.tencent.cloud.mqtt.mqtt.MqttSource;
+import com.tencent.cloud.mqtt.rocketmq.RocketMQSink;
+import com.tencent.cloud.mqtt.rocketmq.RocketMQSource;
 
 public class TaskManager {
     private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
@@ -171,8 +173,20 @@ public class TaskManager {
         return switch (connector.getType()) {
             case MQTT -> new MqttSource(connector, node.required("topic_filter").asText(),
                 "source-" + taskName);
-            case RocketMQ -> throw new UnsupportedOperationException("RocketMQ source not yet implemented");
+            case RocketMQ -> new RocketMQSource(connector, node.required("consumer_group").asText(),
+                parseTopics(node.required("topics")));
         };
+    }
+
+    private static List<String> parseTopics(JsonNode topicsNode) {
+        List<String> topics = new ArrayList<>();
+        for (JsonNode topic : topicsNode) {
+            topics.add(topic.asText());
+        }
+        if (topics.isEmpty()) {
+            throw new IllegalArgumentException("RocketMQ source requires at least one topic");
+        }
+        return topics;
     }
 
     private static Sink parseSink(JsonNode node, Map<String, Connector> connectors, String taskName) {
@@ -180,7 +194,7 @@ public class TaskManager {
         return switch (connector.getType()) {
             case MQTT -> new MqttSink(connector, node.required("topic").asText(),
                 "sink-" + taskName);
-            case RocketMQ -> throw new UnsupportedOperationException("RocketMQ sink not yet implemented");
+            case RocketMQ -> new RocketMQSink(connector, node.required("topic").asText());
         };
     }
 
