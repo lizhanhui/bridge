@@ -41,20 +41,31 @@ public class Task {
         return name;
     }
 
+    /**
+     * Crash-safety contract: a polled record is acked at the source only once
+     * it is fully processed — filtered out by the transform, dropped by the
+     * max_hops check, or after every generated result record has been
+     * published to the sink ({@link Sink#publish} is blocking and fail-fast,
+     * so reaching the ack means the sink durably processed all results).
+     * A record whose processing dies mid-flight stays unacked and is
+     * redelivered by the broker after restart.
+     */
     public void launch() throws InterruptedException {
         log.info("Task {} started", name);
         try {
-            Record<String, String> record;
+            AckableRecord record;
             while ((record = source.poll()) != null) {
                 int hopCount = hopCount(record);
                 if (hopCount > maxHops) {
                     log.info("Task {} dropping record: {}={} exceeds max_hops {}", name,
                         HOP_COUNT_HEADER, hopCount, maxHops);
+                    record.ack();
                     continue;
                 }
                 setHopCount(record, hopCount + 1);
                 transform.transform(record)
                     .ifPresent(records -> records.forEach(sink::publish));
+                record.ack();
             }
         } finally {
             try {
