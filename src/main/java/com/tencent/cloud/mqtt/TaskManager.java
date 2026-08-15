@@ -29,7 +29,8 @@ public class TaskManager {
     private static final int DEFAULT_PARALLELISM = 1;
 
     /** One lane of a task: a fully-named task ready for connector construction. */
-    record TaskSpec(String name, String sql, int maxHops, JsonNode source, JsonNode sink) {}
+    record TaskSpec(String name, String sql, int maxHops, int parallelism,
+                    JsonNode source, JsonNode sink) {}
 
     public static void main(String[] args) throws IOException, InterruptedException {
         Path configPath = Path.of(args.length > 0 ? args[0] : DEFAULT_CONFIG_PATH);
@@ -80,7 +81,7 @@ public class TaskManager {
             JsonNode source = taskNode.required("source");
             JsonNode sink = taskNode.required("sink");
             for (int seq = 0; seq < parallelism; seq++) {
-                specs.add(new TaskSpec(name + "-" + seq, sql, maxHops, source, sink));
+                specs.add(new TaskSpec(name + "-" + seq, sql, maxHops, parallelism, source, sink));
             }
         }
         return specs;
@@ -92,12 +93,47 @@ public class TaskManager {
 
         List<Task> tasks = new ArrayList<>();
         for (TaskSpec spec : expandTaskConfigs(root.required("tasks"))) {
-            Source source = parseSource(spec.source(), connectors, spec.name());
+            warnIfUnsharedMqttSource(spec, connectors);
+            Source source = null;
+            Sink sink = null;
+            try {
+                source = parseSource(spec.source(), connectors, spec.name());
+                sink = parseSink(spec.sink(), connectors, spec.name());
+            } catch (RuntimeException e) {
+                // Don't leak clients from a partially-built lane
+                if (source != null) {
+                    source.close();
+                }
+                if (sink != null) {
+                    sink.close();
+                }
+                throw e;
+            }
             Transform<String, String> transform = new SQLTransform<>(spec.sql());
-            Sink sink = parseSink(spec.sink(), connectors, spec.name());
             tasks.add(new Task(spec.name(), source, transform, sink, spec.maxHops()));
         }
         return tasks;
+    }
+
+    /**
+     * Parallel MQTT lanes only split load under a shared subscription
+     * ($share/<group>/...); with a plain filter every lane receives every
+     * message, duplicating deliveries at the sink.
+     */
+    private static void warnIfUnsharedMqttSource(TaskSpec spec, Map<String, Connector> connectors) {
+        if (spec.parallelism() <= 1) {
+            return;
+        }
+        Connector connector = connectors.get(spec.source().path("connector_id").asText());
+        if (connector == null || connector.getType() != ConnectorType.MQTT) {
+            return;
+        }
+        String topicFilter = spec.source().path("topic_filter").asText("");
+        if (!topicFilter.startsWith("$share/")) {
+            log.warn("Task {}: parallelism > 1 with non-shared MQTT filter '{}' "
+                + "— every lane will receive every message (N× duplicates at sink)",
+                spec.name(), topicFilter);
+        }
     }
 
     private static Map<String, Connector> parseConnectors(JsonNode connectorsNode) {

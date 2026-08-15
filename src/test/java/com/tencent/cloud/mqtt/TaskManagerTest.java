@@ -74,4 +74,11 @@ class TaskManagerTest {
         assertEquals(5, specs.get(0).maxHops());
         assertEquals(5, specs.get(1).maxHops());
     }
+
+    @Test
+    void specCarriesParallelismForLoadTimeChecks() throws Exception {
+        List<TaskManager.TaskSpec> specs =
+            TaskManager.expandTaskConfigs(tasksNode("[" + taskJson("t", "3") + "]"));
+        assertEquals(3, specs.get(0).parallelism());
+    }
 }
