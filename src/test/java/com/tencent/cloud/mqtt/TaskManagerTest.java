@@ -68,8 +68,9 @@ class TaskManagerTest {
 
     @Test
     void rejectsDuplicateLaneNames() throws Exception {
+        // Two tasks with the same base name both produce lane "t-0".
         JsonNode node = tasksNode(
-            "[" + taskJson("t", "2") + ", " + taskJson("t-0", null) + "]");
+            "[" + taskJson("t", "2") + ", " + taskJson("t", null) + "]");
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
             () -> TaskManager.expandTaskConfigs(node));
         assertTrue(e.getMessage().contains("t-0"),
