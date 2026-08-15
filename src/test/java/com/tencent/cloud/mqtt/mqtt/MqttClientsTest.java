@@ -2,6 +2,7 @@ package com.tencent.cloud.mqtt.mqtt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
@@ -29,5 +30,10 @@ class MqttClientsTest {
         assertEquals("mqtt.example.com", hp.host());
         assertEquals(1883, hp.port());
         assertFalse(hp.ssl());
+    }
+
+    @Test
+    void rejectsMalformedPort() {
+        assertThrows(IllegalArgumentException.class, () -> MqttClients.parseAccessPoint("host:abc"));
     }
 }
