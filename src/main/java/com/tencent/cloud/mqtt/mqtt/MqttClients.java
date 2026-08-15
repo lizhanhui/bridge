@@ -45,10 +45,12 @@ final class MqttClients {
         }
         String username = connector.getUsername();
         if (username != null && !username.isBlank()) {
-            builder = builder.simpleAuth()
-                .username(username)
-                .password(connector.getPassword().getBytes(StandardCharsets.UTF_8))
-                .applySimpleAuth();
+            var auth = builder.simpleAuth().username(username);
+            String password = connector.getPassword();
+            if (password != null) {
+                auth = auth.password(password.getBytes(StandardCharsets.UTF_8));
+            }
+            builder = auth.applySimpleAuth();
         }
         return builder.buildAsync();
     }
