@@ -15,9 +15,10 @@ import com.tencent.cloud.mqtt.model.Connector;
 
 /**
  * Subscribes to an MQTT topic filter and exposes messages via {@link #poll()}.
- * The hivemq async callback feeds a bounded queue, giving natural backpressure;
- * when the queue stays full the message is dropped (logged) rather than
- * stalling the client.
+ * The hivemq async callback feeds a bounded queue, giving natural backpressure.
+ * When the queue is full, the 5s offer gives a grace window for the consumer to
+ * catch up before the message is dropped (logged) — at the cost of potentially
+ * stalling the client's callback thread under sustained backpressure.
  */
 public class MqttSource implements Source {
     private static final Logger log = LoggerFactory.getLogger(MqttSource.class);
@@ -33,25 +34,32 @@ public class MqttSource implements Source {
     public MqttSource(Connector connector, String topicFilter) {
         this.client = MqttClients.buildAsyncClient(connector, "source");
         client.toBlocking().connect();
-        client.toAsync().subscribeWith()
-            .topicFilter(topicFilter)
-            .qos(MqttQos.AT_LEAST_ONCE)
-            .callback(publish -> {
-                Record<String, String> record = new Record<>(
-                    publish.getTopic().toString(),
-                    new String(publish.getPayloadAsBytes(), StandardCharsets.UTF_8),
-                    System.currentTimeMillis());
-                try {
-                    if (!queue.offer(record, OFFER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                        log.error("Source queue full for {}s, dropping message from topic {}",
-                            OFFER_TIMEOUT_MS / 1000, publish.getTopic());
+        try {
+            client.toAsync().subscribeWith()
+                .topicFilter(topicFilter)
+                .qos(MqttQos.AT_LEAST_ONCE)
+                .callback(publish -> {
+                    Record<String, String> record = new Record<>(
+                        publish.getTopic().toString(),
+                        new String(publish.getPayloadAsBytes(), StandardCharsets.UTF_8),
+                        System.currentTimeMillis());
+                    try {
+                        if (!queue.offer(record, OFFER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                            log.error("Source queue full for {}s, dropping message from topic {}",
+                                OFFER_TIMEOUT_MS / 1000, publish.getTopic());
+                        }
+                    } catch (InterruptedException e) {
+                        log.warn("Interrupted while enqueueing message from topic {}, dropping",
+                            publish.getTopic());
+                        Thread.currentThread().interrupt();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            })
-            .send()
-            .join();
+                })
+                .send()
+                .join();
+        } catch (RuntimeException e) {
+            client.toBlocking().disconnect();
+            throw e;
+        }
         log.info("MqttSource subscribed to {} on {}", topicFilter, connector.getAccessPoint());
     }
 
