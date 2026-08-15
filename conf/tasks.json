@@ -47,6 +47,19 @@
                 "connector_id": "mqtt-knbz9ga3",
                 "topic": "home/room/1"
             }
+        },
+        {
+            "name": "mqtt2rmq-projection-task",
+            "source": {
+                "connector_id": "mqtt-knbz9ga3",
+                "topic_filter": "$share/group-2/home/#"
+            },
+            "sql": "SELECT payload.age, payload.address FROM payload",
+            "max_hops": 1,
+            "sink": {
+                "connector_id": "rmq-1234",
+                "topic": "home"
+            }
         }
     ]
 }
