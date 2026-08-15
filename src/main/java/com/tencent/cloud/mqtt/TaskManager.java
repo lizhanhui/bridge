@@ -103,20 +103,17 @@ public class TaskManager {
             warnIfUnsharedMqttSource(spec, connectors);
             Source source = null;
             Sink sink = null;
+            Transform<String, String> transform = null;
             try {
                 source = parseSource(spec.source(), connectors, spec.name());
                 sink = parseSink(spec.sink(), connectors, spec.name());
+                transform = new SQLTransform<>(spec.sql());
             } catch (RuntimeException e) {
                 // Don't leak clients from a partially-built lane
-                if (source != null) {
-                    source.close();
-                }
-                if (sink != null) {
-                    sink.close();
-                }
+                closeQuietly(source, e);
+                closeQuietly(sink, e);
                 throw e;
             }
-            Transform<String, String> transform = new SQLTransform<>(spec.sql());
             tasks.add(new Task(spec.name(), source, transform, sink, spec.maxHops()));
         }
         return tasks;
@@ -137,9 +134,21 @@ public class TaskManager {
         }
         String topicFilter = spec.source().path("topic_filter").asText("");
         if (!topicFilter.startsWith("$share/")) {
-            log.warn("Task {}: parallelism > 1 with non-shared MQTT filter '{}' "
-                + "— every lane will receive every message (N× duplicates at sink)",
-                spec.name(), topicFilter);
+            log.warn("Task {}: parallelism={} with non-shared MQTT filter '{}' "
+                + "-- every lane will receive every message ({}x duplicates at sink)",
+                spec.name(), spec.parallelism(), topicFilter, spec.parallelism());
+        }
+    }
+
+    /** Closes {@code c} if non-null; a close failure is suppressed onto {@code primary}. */
+    private static void closeQuietly(AutoCloseable c, RuntimeException primary) {
+        if (c == null) {
+            return;
+        }
+        try {
+            c.close();
+        } catch (Exception closeEx) {
+            primary.addSuppressed(closeEx);
         }
     }
 
