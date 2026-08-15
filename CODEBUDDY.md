@@ -22,7 +22,7 @@ Data flow: **Source → Transform → Sink**, orchestrated per `Task`.
 - `com.tencent.cloud.mqtt` — core abstractions:
   - `Source`, `Sink` — marker interfaces (no methods yet)
   - `Transform<K, V>` — `Optional<List<Record<K, V>>> transform(Record<K, V>)` using Kafka Streams' `org.apache.kafka.streams.processor.api.Record`; empty = record filtered out
-  - `Task` — a named Source/Transform/Sink triple with a `launch()` stub
+  - `Task` — a named Source/Transform/Sink triple with a `launch()` loop; enforces loop prevention via the `bridge-hop-count` record header (travels as an MQTT/RocketMQ user property): incremented on every pass, records arriving with a count greater than the task's `max_hops` (default 1) are skipped (which also acks them)
   - `TaskManager` — main entry point; loads `conf/tasks.json`, builds connectors and tasks
   - `SQLTransform<K, V>` — Transform implementation using PartiQL (`partiql-lang-kotlin`) over JSON payloads. The query is compiled once in the constructor and reused; JSON is parsed via ion-java (Ion is a superset of JSON); the record value (must be JSON text) is bound to the global name `payload`, so SQL in task configs reads `SELECT ... FROM payload WHERE ...`. Malformed JSON payloads are dropped (logged) and yield empty. Output records reuse the input key/timestamp/headers with each result row serialized back to JSON.
 - `com.tencent.cloud.mqtt.model` — config model POJOs mirroring `conf/tasks.json`:
@@ -30,7 +30,7 @@ Data flow: **Source → Transform → Sink**, orchestrated per `Task`.
   - `MqttSource` (topic filter, supports MQTT shared subscriptions like `$share/group/...`), `MqttSink` (topic)
   - `RocketMQSource` (consumer group + topic list), `RocketMQSink` (topic)
 
-`conf/tasks.json` schema: a `connectors` array (id/type/access_point/username/password) and a `tasks` array; each task references connectors by `connector_id` and carries a `sql` PartiQL statement executed against the incoming payload.
+`conf/tasks.json` schema: a `connectors` array (id/type/access_point/username/password) and a `tasks` array; each task references connectors by `connector_id`, carries a `sql` PartiQL statement executed against the incoming payload, and may set `max_hops` (loop-prevention limit, default 1).
 
 ## Key dependencies
 

@@ -24,6 +24,7 @@
                 "topic_filter": "$share/group-1/home/#"
             },
             "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "max_hops": 1,
             "sink": {
                 "connector_id": "rmq-1234",
                 "topic": "home"
@@ -40,6 +41,7 @@
                 ]
             },
             "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "max_hops": 1,
             "sink": {
                 "connector_id": "mqtt-knbz9ga3",
                 "topic": "home/room/1"

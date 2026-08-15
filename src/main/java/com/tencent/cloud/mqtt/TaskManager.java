@@ -22,6 +22,9 @@ public class TaskManager {
 
     private static final String DEFAULT_CONFIG_PATH = "conf/tasks.json";
 
+    /** Default loop-prevention limit when a task does not set {@code max_hops}. */
+    private static final int DEFAULT_MAX_HOPS = 1;
+
     public static void main(String[] args) throws IOException, InterruptedException {
         Path configPath = Path.of(args.length > 0 ? args[0] : DEFAULT_CONFIG_PATH);
         List<Task> tasks = loadTasks(configPath);
@@ -62,7 +65,8 @@ public class TaskManager {
             Source source = parseSource(taskNode.required("source"), connectors, name);
             Transform<String, String> transform = new SQLTransform<>(taskNode.required("sql").asText());
             Sink sink = parseSink(taskNode.required("sink"), connectors, name);
-            tasks.add(new Task(name, source, transform, sink));
+            int maxHops = taskNode.path("max_hops").asInt(DEFAULT_MAX_HOPS);
+            tasks.add(new Task(name, source, transform, sink, maxHops));
         }
         return tasks;
     }
