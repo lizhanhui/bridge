@@ -1,0 +1,65 @@
+{
+    "connectors": [
+        {
+            "id": "mqtt-example",
+            "type": "MQTT",
+            "access_point": "mqtt.example.com:8883",
+            "username": "<mqtt-username>",
+            "password": "<mqtt-password>"
+        },
+
+        {
+            "id": "rmq-example",
+            "type": "RocketMQ",
+            "access_point": "rocketmq-proxy.example.com:8081",
+            "username": "<rocketmq-username>",
+            "password": "<rocketmq-password>"
+        }
+    ],
+    "tasks": [
+        {
+            "name": "mqtt2rmq-task-name",
+            "parallelism": 2,
+            "source": {
+                "connector_id": "mqtt-example",
+                "topic_filter": "$share/group-1/home/#"
+            },
+            "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "max_hops": 1,
+            "sink": {
+                "connector_id": "rmq-example",
+                "topic": "home"
+            }
+        },
+        {
+            "name": "rmq2mqtt-task-name",
+            "source": {
+                "connector_id": "rmq-example",
+                "consumer_group": "Group-0",
+                "topics": [
+                    "home",
+                    "iov"
+                ]
+            },
+            "sql": "SELECT * FROM payload WHERE payload.age < 30 and payload.address.number = 555",
+            "max_hops": 1,
+            "sink": {
+                "connector_id": "mqtt-example",
+                "topic": "home/room/1"
+            }
+        },
+        {
+            "name": "mqtt2rmq-projection-task",
+            "source": {
+                "connector_id": "mqtt-example",
+                "topic_filter": "$share/group-2/home/#"
+            },
+            "sql": "SELECT payload.age, payload.address FROM payload",
+            "max_hops": 1,
+            "sink": {
+                "connector_id": "rmq-example",
+                "topic": "home"
+            }
+        }
+    ]
+}
