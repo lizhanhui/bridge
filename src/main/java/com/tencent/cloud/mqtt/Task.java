@@ -1,6 +1,11 @@
 package com.tencent.cloud.mqtt;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class Task {
+    private static final Logger log = LoggerFactory.getLogger(Task.class);
+
     private final String name;
 
     private final Source source;
@@ -16,8 +21,14 @@ public class Task {
         this.sink = sink;
     }
 
-    public void launch() {
+    public String getName() {
+        return name;
+    }
 
+    public void launch() throws InterruptedException {
+        // TODO: wire source -> transform -> sink message flow
+        log.info("Task {} started", name);
+        Thread.sleep(Long.MAX_VALUE);
     }
 
 }

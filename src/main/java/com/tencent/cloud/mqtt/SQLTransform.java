@@ -16,6 +16,16 @@ import org.partiql.lang.eval.ExprValueExtensionsKt;
 import org.partiql.lang.eval.Expression;
 
 public class SQLTransform implements Transform {
+    private final String sql;
+
+    public SQLTransform(String sql) {
+        this.sql = sql;
+    }
+
+    public String getSql() {
+        return sql;
+    }
+
     void transform() throws Exception {
         String jsons = """
             {"id": "1", "name": "person_1", "age": 32, "address": "555 1st street, Seattle", "tags": []}
