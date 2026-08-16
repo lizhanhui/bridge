@@ -17,7 +17,7 @@
 - Test: `src/test/java/com/tencent/cloud/mqtt/mqtt/MqttRecordMapperTest.java`
 
 **Header name constants** (public static final String, on the mapper):
-`mqtt.topic` (H_TOPIC), `mqtt.qos` (H_QOS), `mqtt.retained` (H_RETAINED), `mqtt.duplicate` (H_DUPLICATE), `mqtt.message.packet.id` (H_PACKET_ID — defined but never populated), `mqtt.content.type` (H_CONTENT_TYPE), `mqtt.correlation.data` (H_CORRELATION_DATA), `mqtt.response.topic` (H_RESPONSE_TOPIC), `mqtt.message.expiry.interval` (H_MESSAGE_EXPIRY_INTERVAL). Plus `$__messageId` (USER_PROPERTY_MESSAGE_ID) and the `$__` prefix constant (BROKER_PROPERTY_PREFIX). All header string values are UTF-8 encoded.
+`src.mqtt.topic` (H_SRC_TOPIC — informational source topic: set on consume, propagates downstream as a user property), `dst.mqtt.topic` (H_DST_TOPIC — deliberate sink-topic override: consumed on publish, NOT propagated), `mqtt.qos` (H_QOS), `mqtt.retained` (H_RETAINED), `mqtt.duplicate` (H_DUPLICATE), `mqtt.message.packet.id` (H_PACKET_ID — defined but never populated), `mqtt.content.type` (H_CONTENT_TYPE), `mqtt.correlation.data` (H_CORRELATION_DATA), `mqtt.response.topic` (H_RESPONSE_TOPIC), `mqtt.message.expiry.interval` (H_MESSAGE_EXPIRY_INTERVAL). Plus `$__messageId` (USER_PROPERTY_MESSAGE_ID) and the `$__` prefix constant (BROKER_PROPERTY_PREFIX). All header string values are UTF-8 encoded.
 
 **Step 1: Write the failing tests**
 
@@ -35,8 +35,9 @@ void mapsPublishToRecordPreservingProtocolInfoAndUserProperties() {
         .responseTopic("reply/topic")
         .messageExpiryInterval(60)
         .payload("{\"age\":20}".getBytes(StandardCharsets.UTF_8))
-        .userProperty("$__messageId", "msg-123")
-        .userProperty("custom", "v")
+        .userProperties(Mqtt5UserProperties.of(
+            Mqtt5UserProperty.of("$__messageId", "msg-123"),
+            Mqtt5UserProperty.of("custom", "v")))
         .build();
 
     Record<String, String> record = MqttRecordMapper.toRecord(publish);
@@ -44,7 +45,7 @@ void mapsPublishToRecordPreservingProtocolInfoAndUserProperties() {
     assertEquals("msg-123", record.key());                      // key from $__messageId
     assertEquals("{\"age\":20}", record.value());               // payload direct copy
     Headers h = record.headers();
-    assertEquals("home/room/1", stringHeader(h, "mqtt.topic"));
+    assertEquals("home/room/1", stringHeader(h, "src.mqtt.topic"));
     assertEquals("1", stringHeader(h, "mqtt.qos"));
     assertEquals("true", stringHeader(h, "mqtt.retained"));
     assertEquals("false", stringHeader(h, "mqtt.duplicate"));
@@ -68,9 +69,9 @@ Sink direction — `toPublish(Record, String defaultTopic, MqttQos defaultQos)`:
 
 ```java
 @Test
-void headersOverrideConfiguredTopicAndQos() {
+void dstTopicHeaderOverridesConfiguredTopicAndQos() {
     Record<String, String> record = new Record<>("k", "v", 1L, new RecordHeaders()
-        .add("mqtt.topic", utf8("override/topic"))
+        .add("dst.mqtt.topic", utf8("override/topic"))
         .add("mqtt.qos", utf8("0"))
         .add("mqtt.retained", utf8("true")));
 
@@ -93,7 +94,8 @@ void defaultsUsedWhenHeadersAbsent() {
 @Test
 void userPropertyHeadersRoundTripButReservedAndBrokerHeadersAreExcluded() {
     Record<String, String> record = new Record<>("k", "v", 1L, new RecordHeaders()
-        .add("mqtt.topic", utf8("t"))
+        .add("src.mqtt.topic", utf8("home/in"))
+        .add("dst.mqtt.topic", utf8("override/out"))
         .add("mqtt.duplicate", utf8("true"))
         .add("mqtt.message.packet.id", utf8("7"))
         .add("$__messageId", utf8("msg-123"))
@@ -102,10 +104,13 @@ void userPropertyHeadersRoundTripButReservedAndBrokerHeadersAreExcluded() {
 
     Mqtt5Publish publish = MqttRecordMapper.toPublish(record, "default", MqttQos.AT_LEAST_ONCE);
 
-    List<MqttUserProperty> props = publish.getUserProperties().asList();
-    assertEquals(1, props.size());
-    assertEquals("custom", props.get(0).getName().toString());
-    assertEquals("v", props.get(0).getValue().toString());
+    assertEquals("override/out", publish.getTopic().toString());
+    List<? extends Mqtt5UserProperty> props = publish.getUserProperties().asList();
+    assertEquals(2, props.size());                             // src.mqtt.topic propagates; dst.mqtt.topic does not
+    assertEquals("src.mqtt.topic", props.get(0).getName().toString());
+    assertEquals("home/in", props.get(0).getValue().toString());
+    assertEquals("custom", props.get(1).getName().toString());
+    assertEquals("v", props.get(1).getValue().toString());
 }
 
 @Test
@@ -130,26 +135,32 @@ Expected: compilation failure — class does not exist.
 package com.tencent.cloud.mqtt.mqtt;
 
 // Source direction: toRecord(Mqtt5Publish)
-//   - headers: mqtt.topic, mqtt.qos (code as string), mqtt.retained, mqtt.duplicate,
+//   - headers: src.mqtt.topic (the publish's own topic), mqtt.qos (code as string),
+//     mqtt.retained, mqtt.duplicate,
 //     mqtt.content.type / mqtt.correlation.data (raw bytes, duplicate() the ByteBuffer
 //     before reading) / mqtt.response.topic / mqtt.message.expiry.interval — optional ones
 //     only when present
-//   - every user property → header with same name (UTF-8)
+//   - every user property → header with same name (UTF-8), skipping names in the
+//     consume-reserved set (src.mqtt.topic + the mqtt.* protocol headers) with a
+//     warning so they cannot shadow the real protocol headers; dst.mqtt.topic is
+//     deliberately NOT reserved on consume — it is a routing-hint channel for
+//     trusted upstreams, not a security boundary
 //   - key = value of $__messageId user property, else null
 //   - timestamp = System.currentTimeMillis()
 //   - value = payload bytes as UTF-8 string
 //   - build headers with org.apache.kafka.common.header.internals.RecordHeaders
 //
 // Sink direction: toPublish(Record<String,String>, String defaultTopic, MqttQos defaultQos)
-//   - Mqtt5Publish.builder(): topic = mqtt.topic header or defaultTopic;
+//   - Mqtt5Publish.builder(): topic = dst.mqtt.topic header or defaultTopic;
 //     qos = parse mqtt.qos header (fromCode; on NumberFormatException or unknown code,
 //     log.warn and use defaultQos); retain = parse mqtt.retained ("true" → true);
 //     contentType / correlationData (ByteBuffer.wrap) / responseTopic /
 //     messageExpiryInterval (long seconds) from their headers when present
-//   - userProperty(name, value) for every header that is NOT in the reserved set
-//     {mqtt.topic, mqtt.qos, mqtt.retained, mqtt.duplicate, mqtt.message.packet.id,
+//   - userProperty(name, value) for every header that is NOT in the publish-consumed
+//     set {mqtt.qos, mqtt.retained, mqtt.duplicate, mqtt.message.packet.id,
 //      mqtt.content.type, mqtt.correlation.data, mqtt.response.topic,
-//      mqtt.message.expiry.interval} and does NOT start with "$__"
+//      mqtt.message.expiry.interval, dst.mqtt.topic} and does NOT start with "$__"
+//     — src.mqtt.topic is NOT in that set, so it propagates as a user property
 //   - payload = record value UTF-8 bytes
 ```
 
