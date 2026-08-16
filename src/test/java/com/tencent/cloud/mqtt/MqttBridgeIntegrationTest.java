@@ -167,6 +167,28 @@ class MqttBridgeIntegrationTest {
             MAPPER.readTree(new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8)));
         assertEquals(Optional.of("1"), userProperty(received, Task.HOP_COUNT_HEADER));
         assertEquals(Optional.of("it"), userProperty(received, "origin"));
+        assertEquals(Optional.of("it/happy/in"), userProperty(received, "src.mqtt.topic"));
+    }
+
+    @Test
+    void dstTopicHeaderReroutesOutput() throws Exception {
+        startTask("dst-0", "it/dst/in",
+            "SELECT * FROM payload",
+            "it/dst-out/configured", 1);
+        Mqtt5Publishes publishes = subscribeVerifier("verifier-dst", "it/dst-out/+");
+
+        publish("it/dst/in", "{\"marker\":\"reroute\"}",
+            "dst.mqtt.topic", "it/dst-out/override");
+
+        Mqtt5Publish received = publishes.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS).orElse(null);
+        assertNotNull(received, "expected rerouted message on the dst.mqtt.topic topic");
+        assertEquals("it/dst-out/override", received.getTopic().toString());
+        String body = new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8);
+        assertTrue(body.contains("reroute"), "unexpected payload: " + body);
+        assertEquals(Optional.of("it/dst/in"), userProperty(received, "src.mqtt.topic"));
+        assertEquals(Optional.empty(), userProperty(received, "dst.mqtt.topic"));
+        assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
+            "nothing should arrive on the sink's configured topic");
     }
 
     @Test
