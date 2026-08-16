@@ -212,4 +212,22 @@ class MqttBridgeIntegrationTest {
         assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
             "over-limit record must not be republished");
     }
+
+    @Test
+    void dropsMalformedJsonAndKeepsProcessing() throws Exception {
+        startTask("badjson-0", "it/badjson/in",
+            "SELECT * FROM payload WHERE payload.temp > 20",
+            "it/badjson/out", 1);
+        Mqtt5Publishes publishes = subscribeVerifier("verifier-badjson", "it/badjson/out");
+
+        publish("it/badjson/in", "this is not json");
+        publish("it/badjson/in", "{\"device\":\"d2\",\"temp\":30}");
+
+        Mqtt5Publish received = publishes.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS).orElse(null);
+        assertNotNull(received, "task lane must survive a malformed record");
+        String body = new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8);
+        assertTrue(body.contains("d2"), "expected the valid record after the malformed one, got: " + body);
+        assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
+            "malformed record must not reach the sink");
+    }
 }
