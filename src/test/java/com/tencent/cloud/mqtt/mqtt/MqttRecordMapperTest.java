@@ -44,7 +44,7 @@ class MqttRecordMapperTest {
         assertEquals("msg-123", record.key());
         assertEquals("{\"age\":20}", record.value());
         Headers h = record.headers();
-        assertEquals("home/room/1", stringHeader(h, "mqtt.topic"));
+        assertEquals("home/room/1", stringHeader(h, "src.mqtt.topic"));
         assertEquals("1", stringHeader(h, "mqtt.qos"));
         assertEquals("true", stringHeader(h, "mqtt.retained"));
         assertEquals("false", stringHeader(h, "mqtt.duplicate"));
@@ -64,9 +64,9 @@ class MqttRecordMapperTest {
     }
 
     @Test
-    void headersOverrideConfiguredTopicAndQos() {
+    void dstTopicHeaderOverridesConfiguredTopicAndQos() {
         Record<String, String> record = new Record<>("k", "v", 1L, new RecordHeaders()
-            .add("mqtt.topic", utf8("override/topic"))
+            .add("dst.mqtt.topic", utf8("override/topic"))
             .add("mqtt.qos", utf8("0"))
             .add("mqtt.retained", utf8("true")));
 
@@ -89,7 +89,8 @@ class MqttRecordMapperTest {
     @Test
     void userPropertyHeadersRoundTripButReservedAndBrokerHeadersAreExcluded() {
         Record<String, String> record = new Record<>("k", "v", 1L, new RecordHeaders()
-            .add("mqtt.topic", utf8("t"))
+            .add("src.mqtt.topic", utf8("home/in"))
+            .add("dst.mqtt.topic", utf8("override/out"))
             .add("mqtt.duplicate", utf8("true"))
             .add("mqtt.message.packet.id", utf8("7"))
             .add("$__messageId", utf8("msg-123"))
@@ -98,10 +99,13 @@ class MqttRecordMapperTest {
 
         Mqtt5Publish publish = MqttRecordMapper.toPublish(record, "default", MqttQos.AT_LEAST_ONCE);
 
+        assertEquals("override/out", publish.getTopic().toString());
         List<? extends Mqtt5UserProperty> props = publish.getUserProperties().asList();
-        assertEquals(1, props.size());
-        assertEquals("custom", props.get(0).getName().toString());
-        assertEquals("v", props.get(0).getValue().toString());
+        assertEquals(2, props.size());
+        assertEquals("src.mqtt.topic", props.get(0).getName().toString());
+        assertEquals("home/in", props.get(0).getValue().toString());
+        assertEquals("custom", props.get(1).getName().toString());
+        assertEquals("v", props.get(1).getValue().toString());
     }
 
     @Test
@@ -118,15 +122,15 @@ class MqttRecordMapperTest {
             .topic("real/topic")
             .payload(new byte[0])
             .userProperties(Mqtt5UserProperties.of(
-                Mqtt5UserProperty.of("mqtt.topic", "evil/topic")))
+                Mqtt5UserProperty.of("src.mqtt.topic", "evil/topic")))
             .build();
 
         Record<String, String> record = MqttRecordMapper.toRecord(publish);
 
         Headers h = record.headers();
-        assertEquals("real/topic", stringHeader(h, "mqtt.topic"));
+        assertEquals("real/topic", stringHeader(h, "src.mqtt.topic"));
         int count = 0;
-        for (Header ignored : h.headers("mqtt.topic")) {
+        for (Header ignored : h.headers("src.mqtt.topic")) {
             count++;
         }
         assertEquals(1, count);

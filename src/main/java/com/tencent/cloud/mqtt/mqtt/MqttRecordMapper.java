@@ -23,13 +23,20 @@ import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishBuilder;
  * Maps between MQTT 5 publishes and bridge records. Protocol info travels in
  * {@code mqtt.*} headers; user properties round-trip as headers with the same
  * name. The record key is the {@value #USER_PROPERTY_MESSAGE_ID} user property.
- * On publish, {@value #BROKER_PROPERTY_PREFIX}-prefixed headers are dropped —
- * they are broker-assigned and the broker sets fresh ones on delivery.
+ * The source topic travels in {@value #H_SRC_TOPIC}: informational, set on
+ * consume, and propagated downstream as a user property. The sink topic can be
+ * deliberately overridden via {@value #H_DST_TOPIC}: it is consumed on publish
+ * and never propagated. On publish, {@value #BROKER_PROPERTY_PREFIX}-prefixed
+ * headers are dropped — they are broker-assigned and the broker sets fresh ones
+ * on delivery.
  */
 public final class MqttRecordMapper {
     private static final Logger log = LoggerFactory.getLogger(MqttRecordMapper.class);
 
-    public static final String H_TOPIC = "mqtt.topic";
+    /** Informational source-topic header: set on consume, propagates downstream as a user property. */
+    public static final String H_SRC_TOPIC = "src.mqtt.topic";
+    /** Deliberate sink-topic routing override: consumed on publish, not propagated. */
+    public static final String H_DST_TOPIC = "dst.mqtt.topic";
     public static final String H_QOS = "mqtt.qos";
     public static final String H_RETAINED = "mqtt.retained";
     public static final String H_DUPLICATE = "mqtt.duplicate";
@@ -44,8 +51,18 @@ public final class MqttRecordMapper {
     public static final String BROKER_PROPERTY_PREFIX = "$__";
 
     private static final Set<String> RESERVED_HEADERS = Set.of(
-        H_TOPIC, H_QOS, H_RETAINED, H_DUPLICATE, H_PACKET_ID,
+        H_SRC_TOPIC, H_QOS, H_RETAINED, H_DUPLICATE, H_PACKET_ID,
         H_CONTENT_TYPE, H_CORRELATION_DATA, H_RESPONSE_TOPIC, H_MESSAGE_EXPIRY_INTERVAL);
+
+    /**
+     * Headers consumed as publish settings and excluded from user properties:
+     * the consume-reserved set minus {@code src.mqtt.topic} (which propagates)
+     * plus {@code dst.mqtt.topic} (which is consumed for routing).
+     */
+    private static final Set<String> PUBLISH_CONSUMED_HEADERS = Set.of(
+        H_QOS, H_RETAINED, H_DUPLICATE, H_PACKET_ID,
+        H_CONTENT_TYPE, H_CORRELATION_DATA, H_RESPONSE_TOPIC, H_MESSAGE_EXPIRY_INTERVAL,
+        H_DST_TOPIC);
 
     private MqttRecordMapper() {
     }
@@ -59,7 +76,7 @@ public final class MqttRecordMapper {
      */
     public static Record<String, String> toRecord(Mqtt5Publish publish) {
         RecordHeaders headers = new RecordHeaders();
-        headers.add(H_TOPIC, utf8(publish.getTopic().toString()));
+        headers.add(H_SRC_TOPIC, utf8(publish.getTopic().toString()));
         headers.add(H_QOS, utf8(String.valueOf(publish.getQos().getCode())));
         headers.add(H_RETAINED, utf8(Boolean.toString(publish.isRetain())));
         // hivemq 1.3.17 does not expose the dup flag on delivered publishes
@@ -98,18 +115,19 @@ public final class MqttRecordMapper {
 
     /**
      * Maps a record to an outgoing publish. Present headers override the configured
-     * defaults ({@code mqtt.topic} over {@code defaultTopic}, {@code mqtt.qos} over
+     * defaults ({@code dst.mqtt.topic} over {@code defaultTopic}, {@code mqtt.qos} over
      * {@code defaultQos}, etc.); malformed or out-of-range header values log a warning
-     * and fall back to the default (or are skipped). Reserved {@code mqtt.*} headers are
-     * consumed as publish settings and {@value #BROKER_PROPERTY_PREFIX}-prefixed headers
-     * are dropped; every other header becomes a user property.
+     * and fall back to the default (or are skipped). The {@code dst.mqtt.topic} and
+     * {@code mqtt.*} setting headers are consumed as publish settings and
+     * {@value #BROKER_PROPERTY_PREFIX}-prefixed headers are dropped; every other header
+     * — including {@code src.mqtt.topic} — becomes a user property.
      */
     public static Mqtt5Publish toPublish(Record<String, String> record, String defaultTopic,
             MqttQos defaultQos) {
         Headers headers = record.headers();
 
         Mqtt5PublishBuilder.Complete builder = Mqtt5Publish.builder()
-            .topic(stringHeader(headers, H_TOPIC, defaultTopic))
+            .topic(stringHeader(headers, H_DST_TOPIC, defaultTopic))
             .qos(qosHeader(headers, defaultQos))
             .retain(retainedHeader(headers))
             .payload(record.value().getBytes(StandardCharsets.UTF_8));
@@ -142,7 +160,7 @@ public final class MqttRecordMapper {
             boolean hasProps = false;
             for (Header header : headers) {
                 String name = header.key();
-                if (!RESERVED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)
+                if (!PUBLISH_CONSUMED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)
                         && header.value() != null) {
                     propsBuilder.add(name, new String(header.value(), StandardCharsets.UTF_8));
                     hasProps = true;
