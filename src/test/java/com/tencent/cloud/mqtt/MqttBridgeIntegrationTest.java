@@ -3,6 +3,8 @@ package com.tencent.cloud.mqtt;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
@@ -165,5 +167,23 @@ class MqttBridgeIntegrationTest {
             MAPPER.readTree(new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8)));
         assertEquals(Optional.of("1"), userProperty(received, Task.HOP_COUNT_HEADER));
         assertEquals(Optional.of("it"), userProperty(received, "origin"));
+    }
+
+    @Test
+    void dropsRecordFilteredOutBySql() throws Exception {
+        startTask("filter-0", "it/filter/in",
+            "SELECT * FROM payload WHERE payload.temp > 20",
+            "it/filter/out", 1);
+        Mqtt5Publishes publishes = subscribeVerifier("verifier-filter", "it/filter/out");
+
+        publish("it/filter/in", "{\"device\":\"cold\",\"temp\":5}");
+        publish("it/filter/in", "{\"device\":\"hot\",\"temp\":25}");
+
+        Mqtt5Publish received = publishes.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS).orElse(null);
+        assertNotNull(received, "expected the matching message");
+        String body = new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8);
+        assertTrue(body.contains("hot"), "only the matching record should be republished, got: " + body);
+        assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
+            "filtered record must not reach the sink");
     }
 }
