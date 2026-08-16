@@ -1,5 +1,7 @@
 # MQTT ↔ Record Header Mapping Implementation Plan
 
+> **Amended 2026-08-16:** header-name references updated for the src/dst topic split (`src.mqtt.topic` / `dst.mqtt.topic` replace `mqtt.topic`); see `docs/plans/2026-08-16-src-dst-topic-headers-design.md`. The original design used a single dual-role `mqtt.topic` header.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Preserve MQTT protocol info and user properties through the bridge by mapping them to/from Record headers, per the design amendment in `docs/plans/2026-08-15-mqtt-source-sink-design.md` (read the "Amendment (2026-08-15)" section first).
