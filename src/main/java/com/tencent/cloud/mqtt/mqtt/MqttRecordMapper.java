@@ -26,7 +26,10 @@ import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5PublishBuilder;
  * The source topic travels in {@value #H_SRC_TOPIC}: informational, set on
  * consume, and propagated downstream as a user property. The sink topic can be
  * deliberately overridden via {@value #H_DST_TOPIC}: it is consumed on publish
- * and never propagated. On publish, {@value #BROKER_PROPERTY_PREFIX}-prefixed
+ * and never propagated. {@value #H_DST_TOPIC} is deliberately not reserved on
+ * consume, so any client able to publish to a source topic can reroute that
+ * task's sink output — this is a routing-hint channel for trusted upstreams,
+ * not a security boundary. On publish, {@value #BROKER_PROPERTY_PREFIX}-prefixed
  * headers are dropped — they are broker-assigned and the broker sets fresh ones
  * on delivery.
  */
@@ -50,6 +53,7 @@ public final class MqttRecordMapper {
     public static final String USER_PROPERTY_MESSAGE_ID = "$__messageId";
     public static final String BROKER_PROPERTY_PREFIX = "$__";
 
+    /** Consume-side shadow set: user properties with these names are skipped on consume (see {@link #PUBLISH_CONSUMED_HEADERS}). */
     private static final Set<String> RESERVED_HEADERS = Set.of(
         H_SRC_TOPIC, H_QOS, H_RETAINED, H_DUPLICATE, H_PACKET_ID,
         H_CONTENT_TYPE, H_CORRELATION_DATA, H_RESPONSE_TOPIC, H_MESSAGE_EXPIRY_INTERVAL);
@@ -70,8 +74,9 @@ public final class MqttRecordMapper {
     /**
      * Maps an incoming publish to a record. The key is the value of the
      * {@value #USER_PROPERTY_MESSAGE_ID} user property, or {@code null} when absent.
-     * User properties whose names collide with reserved {@code mqtt.*} headers are
-     * skipped (with a warning) so they cannot shadow the real protocol headers.
+     * User properties whose names collide with reserved headers ({@code mqtt.*}
+     * protocol headers plus {@code src.mqtt.topic}) are skipped (with a warning)
+     * so they cannot shadow the real protocol headers.
      * Timestamp is receive time.
      */
     public static Record<String, String> toRecord(Mqtt5Publish publish) {

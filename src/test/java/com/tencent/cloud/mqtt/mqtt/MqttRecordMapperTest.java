@@ -163,6 +163,23 @@ class MqttRecordMapperTest {
         assertEquals(120, publish.getMessageExpiryInterval().orElseThrow());
     }
 
+    @Test
+    void dstTopicUserPropertyFromPublisherBecomesRoutingHeader() {
+        Mqtt5Publish publish = Mqtt5Publish.builder()
+            .topic("real/topic")
+            .payload(new byte[0])
+            .userProperties(Mqtt5UserProperties.of(
+                Mqtt5UserProperty.of("dst.mqtt.topic", "reroute/here")))
+            .build();
+
+        Record<String, String> record = MqttRecordMapper.toRecord(publish);
+
+        assertEquals("reroute/here", stringHeader(record.headers(), "dst.mqtt.topic"));
+        // and it survives to drive the sink topic on publish:
+        Mqtt5Publish out = MqttRecordMapper.toPublish(record, "default", MqttQos.AT_LEAST_ONCE);
+        assertEquals("reroute/here", out.getTopic().toString());
+    }
+
     private static String stringHeader(Headers headers, String name) {
         return new String(headers.lastHeader(name).value(), StandardCharsets.UTF_8);
     }
