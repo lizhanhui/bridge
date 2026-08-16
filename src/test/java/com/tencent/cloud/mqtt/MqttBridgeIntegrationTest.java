@@ -1,6 +1,7 @@
 package com.tencent.cloud.mqtt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 import java.nio.charset.StandardCharsets;
@@ -41,6 +42,7 @@ class MqttBridgeIntegrationTest {
 
     private Thread taskThread;
     private Mqtt5BlockingClient verifier;
+    private Mqtt5Publishes verifierPublishes;
 
     private Connector connector() {
         Connector c = new Connector();
@@ -52,11 +54,18 @@ class MqttBridgeIntegrationTest {
 
     /** Starts a real Task on a virtual thread. MqttSource subscribes in its constructor, so the subscription is live when this returns. */
     private void startTask(String name, String inFilter, String sql, String outTopic, int maxHops) {
-        Task task = new Task(name,
-            new MqttSource(connector(), inFilter, "source-" + name),
-            new SQLTransform<>(sql),
-            new MqttSink(connector(), outTopic, "sink-" + name),
-            maxHops);
+        MqttSource source = new MqttSource(connector(), inFilter, "source-" + name);
+        Task task;
+        try {
+            task = new Task(name,
+                source,
+                new SQLTransform<>(sql),
+                new MqttSink(connector(), outTopic, "sink-" + name),
+                maxHops);
+        } catch (RuntimeException e) {
+            source.close();
+            throw e;
+        }
         taskThread = Thread.ofVirtual().start(() -> {
             try {
                 task.launch();
@@ -66,8 +75,8 @@ class MqttBridgeIntegrationTest {
         });
     }
 
-    /** Verifier client subscribed to the given output topic; returns the publishes handle. */
-    private Mqtt5BlockingClient.Mqtt5Publishes subscribeVerifier(String clientId, String outTopic) {
+    /** Verifier client subscribed to the given output topic; returns the publishes handle (closed by tearDown). */
+    private Mqtt5Publishes subscribeVerifier(String clientId, String outTopic) {
         verifier = MqttClient.builder()
             .useMqttVersion5()
             .identifier(clientId)
@@ -75,9 +84,9 @@ class MqttBridgeIntegrationTest {
             .serverPort(HIVEMQ.getMqttPort())
             .buildBlocking();
         verifier.connect();
-        Mqtt5BlockingClient.Mqtt5Publishes publishes = verifier.publishes(MqttGlobalPublishFilter.ALL);
+        verifierPublishes = verifier.publishes(MqttGlobalPublishFilter.ALL);
         verifier.subscribeWith().topicFilter(outTopic).send();
-        return publishes;
+        return verifierPublishes;
     }
 
     private void publish(String topic, String payload, String... userProperties) {
@@ -105,6 +114,10 @@ class MqttBridgeIntegrationTest {
         if (taskThread != null) {
             taskThread.interrupt();
             taskThread.join(10_000);
+            assertFalse(taskThread.isAlive(), "task thread survived interrupt");
+        }
+        if (verifierPublishes != null) {
+            verifierPublishes.close();
         }
         if (verifier != null) {
             verifier.disconnect();
@@ -139,13 +152,14 @@ class MqttBridgeIntegrationTest {
         startTask("happy-0", "it/happy/in",
             "SELECT payload.device AS device, payload.temp * 2 AS doubled FROM payload WHERE payload.temp > 20",
             "it/happy/out", 1);
-        Mqtt5BlockingClient.Mqtt5Publishes publishes = subscribeVerifier("verifier-happy", "it/happy/out");
+        Mqtt5Publishes publishes = subscribeVerifier("verifier-happy", "it/happy/out");
 
         publish("it/happy/in", "{\"device\":\"d1\",\"temp\":25}",
             "origin", "it", "$__messageId", "msg-happy-1");
 
         Mqtt5Publish received = publishes.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS).orElse(null);
         assertNotNull(received, "expected transformed message on sink topic");
+        assertEquals("it/happy/out", received.getTopic().toString());
         assertEquals(
             MAPPER.readTree("{\"device\":\"d1\",\"doubled\":50}"),
             MAPPER.readTree(new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8)));
