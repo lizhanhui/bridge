@@ -21,13 +21,23 @@ import org.slf4j.LoggerFactory;
  * {@code rmq.*} headers; message properties round-trip as headers with the
  * same name. The record key is the broker-assigned message ID (symmetric with
  * the MQTT side, whose {@code $__messageId} user property is the broker's
- * UNIQ_KEY). On produce, {@value #BROKER_PROPERTY_PREFIX}-prefixed headers are
- * dropped — they are broker-assigned MQTT properties.
+ * UNIQ_KEY). The source topic travels in {@value #H_SRC_TOPIC}: informational,
+ * set on consume, and propagated downstream as a message property. The sink
+ * topic can be deliberately overridden via {@value #H_DST_TOPIC}: it is
+ * consumed on produce and never propagated. {@value #H_DST_TOPIC} is
+ * deliberately not reserved on consume, so any client able to publish to a
+ * source topic can reroute that task's sink output — this is a routing-hint
+ * channel for trusted upstreams, not a security boundary. On produce,
+ * {@value #BROKER_PROPERTY_PREFIX}-prefixed headers are dropped — they are
+ * broker-assigned MQTT properties.
  */
 public final class RocketMQRecordMapper {
     private static final Logger log = LoggerFactory.getLogger(RocketMQRecordMapper.class);
 
-    public static final String H_TOPIC = "rmq.topic";
+    /** Informational source-topic header: set on consume, propagates downstream as a message property. */
+    public static final String H_SRC_TOPIC = "src.rmq.topic";
+    /** Deliberate sink-topic routing override: consumed on produce, not propagated. */
+    public static final String H_DST_TOPIC = "dst.rmq.topic";
     public static final String H_MESSAGE_ID = "rmq.message.id";
     public static final String H_TAG = "rmq.tag";
     public static final String H_KEYS = "rmq.keys";
@@ -39,22 +49,33 @@ public final class RocketMQRecordMapper {
     /** Broker-assigned MQTT user-property prefix; such headers are dropped on produce. */
     public static final String BROKER_PROPERTY_PREFIX = "$__";
 
+    /** Consume-side shadow set: properties with these names are skipped on consume (see {@link #PUBLISH_CONSUMED_HEADERS}). */
     private static final Set<String> RESERVED_HEADERS = Set.of(
-        H_TOPIC, H_MESSAGE_ID, H_TAG, H_KEYS, H_BORN_TIMESTAMP,
+        H_SRC_TOPIC, H_MESSAGE_ID, H_TAG, H_KEYS, H_BORN_TIMESTAMP,
         H_DELIVERY_TIMESTAMP, H_DELIVERY_ATTEMPT, H_BORN_HOST);
+
+    /**
+     * Headers consumed as produce settings and excluded from message properties:
+     * the consume-reserved set minus {@code src.rmq.topic} (which propagates)
+     * plus {@code dst.rmq.topic} (which is consumed for routing).
+     */
+    private static final Set<String> PUBLISH_CONSUMED_HEADERS = Set.of(
+        H_MESSAGE_ID, H_TAG, H_KEYS, H_BORN_TIMESTAMP,
+        H_DELIVERY_TIMESTAMP, H_DELIVERY_ATTEMPT, H_BORN_HOST, H_DST_TOPIC);
 
     private RocketMQRecordMapper() {
     }
 
     /**
      * Maps a received message to a record. The key is the broker message ID.
-     * Properties whose names collide with reserved {@code rmq.*} headers are
-     * skipped (with a warning) so they cannot shadow the real protocol headers.
+     * Properties whose names collide with reserved headers ({@code rmq.*}
+     * protocol headers plus {@code src.rmq.topic}) are skipped (with a warning)
+     * so they cannot shadow the real protocol headers.
      * Timestamp is the message born timestamp.
      */
     public static Record<String, String> toRecord(MessageView messageView) {
         RecordHeaders headers = new RecordHeaders();
-        headers.add(H_TOPIC, utf8(messageView.getTopic()));
+        headers.add(H_SRC_TOPIC, utf8(messageView.getTopic()));
         String messageId = messageView.getMessageId().toString();
         headers.add(H_MESSAGE_ID, utf8(messageId));
         messageView.getTag().ifPresent(tag -> headers.add(H_TAG, utf8(tag)));
@@ -83,19 +104,20 @@ public final class RocketMQRecordMapper {
     }
 
     /**
-     * Maps a record to an outgoing message. The {@code rmq.topic} header
+     * Maps a record to an outgoing message. The {@code dst.rmq.topic} header
      * overrides {@code defaultTopic}; {@code rmq.tag} / {@code rmq.keys}
-     * (comma-separated) set the message tag/keys. Reserved {@code rmq.*}
-     * headers are consumed as message settings and
+     * (comma-separated) set the message tag/keys. The {@code dst.rmq.topic} and
+     * reserved {@code rmq.*} headers are consumed as message settings and
      * {@value #BROKER_PROPERTY_PREFIX}-prefixed headers are dropped; every
-     * other header becomes a message property.
+     * other header — including {@code src.rmq.topic} — becomes a message
+     * property.
      */
     public static Message toMessage(ClientServiceProvider provider, Record<String, String> record,
             String defaultTopic) {
         Headers headers = record.headers();
 
         MessageBuilder builder = provider.newMessageBuilder()
-            .setTopic(stringHeader(headers, H_TOPIC, defaultTopic))
+            .setTopic(stringHeader(headers, H_DST_TOPIC, defaultTopic))
             .setBody(record.value().getBytes(StandardCharsets.UTF_8));
 
         String tag = stringHeader(headers, H_TAG, null);
@@ -110,7 +132,7 @@ public final class RocketMQRecordMapper {
         if (headers != null) {
             for (Header header : headers) {
                 String name = header.key();
-                if (!RESERVED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)
+                if (!PUBLISH_CONSUMED_HEADERS.contains(name) && !name.startsWith(BROKER_PROPERTY_PREFIX)
                         && header.value() != null) {
                     builder.addProperty(name, new String(header.value(), StandardCharsets.UTF_8));
                 }

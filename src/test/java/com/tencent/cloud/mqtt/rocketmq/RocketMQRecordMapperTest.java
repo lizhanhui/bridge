@@ -79,7 +79,7 @@ class RocketMQRecordMapperTest {
         assertEquals("msg-1", record.key());
         assertEquals("{\"age\":20}", record.value());
         assertEquals(1234L, record.timestamp());
-        assertEquals("home", header(record, RocketMQRecordMapper.H_TOPIC));
+        assertEquals("home", header(record, RocketMQRecordMapper.H_SRC_TOPIC));
         assertEquals("msg-1", header(record, RocketMQRecordMapper.H_MESSAGE_ID));
         assertEquals("tagA", header(record, RocketMQRecordMapper.H_TAG));
         assertEquals("k1,k2", header(record, RocketMQRecordMapper.H_KEYS));
@@ -93,11 +93,11 @@ class RocketMQRecordMapperTest {
     @Test
     void propertyCollidingWithReservedHeaderIsSkipped() {
         StubMessageView view = new StubMessageView("home", "msg-1", "{}",
-            Map.of("rmq.topic", "evil"), null, List.of(), 0L);
+            Map.of("src.rmq.topic", "evil"), null, List.of(), 0L);
 
         Record<String, String> record = RocketMQRecordMapper.toRecord(view);
 
-        assertEquals("home", header(record, RocketMQRecordMapper.H_TOPIC));
+        assertEquals("home", header(record, RocketMQRecordMapper.H_SRC_TOPIC));
     }
 
     @Test
@@ -120,9 +120,9 @@ class RocketMQRecordMapperTest {
     }
 
     @Test
-    void topicHeaderOverridesDefaultTopic() {
+    void dstTopicHeaderOverridesDefaultTopic() {
         Record<String, String> record = new Record<>("k", "{}", 1L);
-        record.headers().add(RocketMQRecordMapper.H_TOPIC,
+        record.headers().add(RocketMQRecordMapper.H_DST_TOPIC,
             "other".getBytes(StandardCharsets.UTF_8));
 
         Message message = RocketMQRecordMapper.toMessage(
@@ -130,6 +130,33 @@ class RocketMQRecordMapperTest {
 
         assertEquals("other", message.getTopic());
         assertTrue(message.getProperties().isEmpty());
+    }
+
+    @Test
+    void srcTopicHeaderPropagatesAsProperty() {
+        Record<String, String> record = new Record<>("k", "{}", 1L);
+        record.headers().add(RocketMQRecordMapper.H_SRC_TOPIC,
+            "home/in".getBytes(StandardCharsets.UTF_8));
+
+        Message message = RocketMQRecordMapper.toMessage(
+            ClientServiceProvider.loadService(), record, "home");
+
+        assertEquals("home", message.getTopic());
+        assertEquals(Map.of("src.rmq.topic", "home/in"), message.getProperties());
+    }
+
+    @Test
+    void dstTopicPropertyFromProducerBecomesRoutingHeader() {
+        StubMessageView view = new StubMessageView("home", "msg-1", "{}",
+            Map.of("dst.rmq.topic", "reroute"), null, List.of(), 0L);
+
+        Record<String, String> record = RocketMQRecordMapper.toRecord(view);
+
+        assertEquals("reroute", header(record, RocketMQRecordMapper.H_DST_TOPIC));
+        // and it survives to drive the sink topic on produce:
+        Message message = RocketMQRecordMapper.toMessage(
+            ClientServiceProvider.loadService(), record, "home");
+        assertEquals("reroute", message.getTopic());
     }
 
     @Test
@@ -157,8 +184,10 @@ class RocketMQRecordMapperTest {
         Message message = RocketMQRecordMapper.toMessage(
             ClientServiceProvider.loadService(), record, "ignored");
 
-        assertEquals("home", message.getTopic());
-        assertEquals(Map.of("color", "red", Task.HOP_COUNT_HEADER, "1"), message.getProperties());
+        // src.rmq.topic propagates as a property; it no longer overrides the topic
+        assertEquals("ignored", message.getTopic());
+        assertEquals(Map.of("color", "red", Task.HOP_COUNT_HEADER, "1",
+            "src.rmq.topic", "home"), message.getProperties());
         byte[] body = new byte[message.getBody().remaining()];
         message.getBody().get(body);
         assertArrayEquals("payload".getBytes(StandardCharsets.UTF_8), body);
