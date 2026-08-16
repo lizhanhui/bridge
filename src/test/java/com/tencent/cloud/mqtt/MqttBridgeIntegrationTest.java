@@ -149,12 +149,6 @@ class MqttBridgeIntegrationTest {
         }
     }
 
-    /** Asserts nothing arrives on the output topic within the negative window. */
-    private void assertNoMessage(Mqtt5Publishes publishes) throws Exception {
-        assertTrue(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).isEmpty(),
-            "unexpected message on sink topic");
-    }
-
     @Test
     void transformsAndPublishesMatchingRecord() throws Exception {
         startTask("happy-0", "it/happy/in",
