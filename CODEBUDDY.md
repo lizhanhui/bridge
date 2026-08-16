@@ -11,6 +11,7 @@ Early-stage Java (Maven) service that bridges MQTT brokers and RocketMQ: it cons
 - Build: `mvn compile` (or `mvn package` — the shade plugin produces a runnable fat jar `target/bridge-1.0-SNAPSHOT.jar` with `TaskManager` as the manifest main class; run with `java -jar`)
 - Entry point: `com.tencent.cloud.mqtt.TaskManager` — loads `conf/tasks.json` (or path from `args[0]`), builds connectors/tasks, runs each `Task` on its own virtual thread, with a shutdown hook that interrupts task threads
 - Tests: `mvn test` (JUnit 5 + Surefire); run a single test with `mvn test -Dtest=SQLTransformTest`
+- `MqttBridgeIntegrationTest` uses Testcontainers to spin up a HiveMQ broker (`hivemq/hivemq-ce`) — a running Docker daemon is required or those tests fail
 - No lint tooling is configured yet
 - Compiler target is Java 25 — ensure the JDK matches before building
 - Run configuration is defined in `conf/tasks.json` (connectors + tasks)
