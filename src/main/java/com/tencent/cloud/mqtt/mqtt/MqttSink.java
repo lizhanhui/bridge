@@ -29,7 +29,10 @@ public class MqttSink implements Sink {
     @Override
     public void publish(Record<String, String> record) {
         try {
-            Mqtt5Publish publish = MqttRecordMapper.toPublish(record, topic, MqttQos.AT_LEAST_ONCE);
+            // The sink's configured topic always wins: an mqtt.topic header inherited from the
+            // source record must not reroute the output back onto the input topic.
+            Mqtt5Publish publish = MqttRecordMapper.toPublish(record, topic, MqttQos.AT_LEAST_ONCE)
+                .extend().topic(topic).build();
             client.toBlocking().publish(publish);
         } catch (RuntimeException e) {
             log.error("Failed to publish to topic {} on {}", topic, accessPoint, e);
