@@ -9,7 +9,7 @@ Supported flows:
 - MQTT → MQTT
 - RocketMQ → RocketMQ
 
-> **Production status:** early-stage. The publish-before-ack pipeline is unit-tested, sink failures are retried with exponential backoff, and both bridge directions (MQTT → RocketMQ with filter and projection tasks, and RocketMQ → MQTT) have been verified end-to-end against live TDMQ MQTT/RocketMQ clusters, including hop-count loop prevention (see `e2e/E2EClient.java`). It is still not covered by an automated broker-backed integration test suite and is not yet recommended for production rollout. Review [docs/issues.md](docs/issues.md) before deploying it with real traffic. The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
+> **Production status:** early-stage. The publish-before-ack pipeline is unit-tested, sink failures are retried with exponential backoff, and both bridge directions (MQTT → RocketMQ with filter and projection tasks, and RocketMQ → MQTT) have been verified end-to-end against live TDMQ MQTT/RocketMQ clusters, including hop-count loop prevention (see `e2e/E2EClient.java`). The MQTT source and sink are additionally covered by automated broker-backed integration tests: `MqttBridgeIntegrationTest` boots a throwaway HiveMQ broker via Testcontainers (requires Docker) and exercises transformation and projection, SQL filtering, hop-count loop prevention, malformed-payload handling, and `src.mqtt.topic` provenance / `dst.mqtt.topic` routing. The RocketMQ connectors are not yet covered by broker-backed tests. The service is not yet recommended for production rollout; review [docs/issues.md](docs/issues.md) before deploying it with real traffic. The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
 
 ## Table of contents
 
@@ -592,7 +592,7 @@ Build the runnable fat JAR:
 mvn clean package
 ```
 
-The current test suite covers task processing, configuration expansion, PartiQL transformation, and offline protocol mapping. It does not yet provide broker-backed integration tests.
+The current test suite covers task processing, configuration expansion, PartiQL transformation, and offline protocol mapping, plus broker-backed integration tests for the MQTT source and sink (`MqttBridgeIntegrationTest`, Testcontainers HiveMQ — a running Docker daemon is required). The RocketMQ connectors are not yet covered by broker-backed tests.
 
 ## Known limitations
 
