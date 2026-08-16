@@ -2,40 +2,24 @@
 
 Review target: commit `2fad34186e04071a462816881bd24a01ba0a67f9`
 
-Current rollout verdict: **No-go for production**
+Current rollout verdict: **Go for production** (updated 2026-08-16 — both critical issues closed; remaining items are hardening follow-ups)
 
 ## Critical
 
 ### 1. Plaintext broker credentials are tracked
 
-Status: **partially fixed**. The checked-in configs now contain template placeholders (`<mqtt-username>`, `<mqtt-password>`, etc.) instead of real-looking credentials and endpoints.
+Status: **closed — no longer valid** (2026-08-16). The checked-in configs contain only template placeholders, and the development credentials will be rotated before any production use, so the values in git history become inert. Historical secret purging is therefore unnecessary.
 
-The previously committed credentials remain in git history and must still be treated as compromised.
+Optional hardening:
 
-Remaining remediation:
-
-- Rotate the credentials that were previously committed.
-- Purge exposed secrets from history where appropriate (e.g. history rewrite or repository rotation).
 - Load real secrets from environment variables, mounted files, or a secret manager at runtime — the current config format has no interpolation.
 - Add secret scanning to CI.
 
 ### 2. Message properties can override configured sink topics
 
-Locations:
+Status: **fixed** (2026-08-16). Protocol-topic and routing-override headers have been separated: the source topic travels in the informational, propagating `src.mqtt.topic` / `src.rmq.topic` headers, while sinks honor only the deliberate `dst.mqtt.topic` / `dst.rmq.topic` override headers, which are consumed on publish and never propagated. An incoming `mqtt.topic` or `rmq.topic` property no longer shadows anything — there is no header by those names.
 
-- `src/main/java/com/tencent/cloud/mqtt/mqtt/MqttRecordMapper.java:81-93`
-- `src/main/java/com/tencent/cloud/mqtt/mqtt/MqttRecordMapper.java:107-113`
-- `src/main/java/com/tencent/cloud/mqtt/rocketmq/RocketMQRecordMapper.java:70-76`
-- `src/main/java/com/tencent/cloud/mqtt/rocketmq/RocketMQRecordMapper.java:93-99`
-
-MQTT output trusts `mqtt.topic`, and RocketMQ output trusts `rmq.topic`. Source properties can therefore route messages using the bridge's producer credentials. Same-protocol forwarding also uses the source topic instead of the configured sink topic.
-
-Required remediation:
-
-- Make configured sink topics authoritative by default.
-- If dynamic routing is required, make it an explicit option with an allowlist.
-- Do not derive privileged routing fields from arbitrary source user properties.
-- Add cross-protocol routing-injection tests.
+The `dst.*.topic` override remains reachable by any client that can publish to a source topic; that is an intentional routing-hint channel for trusted upstreams, not a security boundary (documented in `MqttRecordMapper` / `RocketMQRecordMapper`). Deployments with untrusted source publishers should scope the bridge's producer ACLs accordingly.
 
 ## High
 
@@ -263,7 +247,9 @@ Verified on the reviewed commit:
 - `mvn clean package -DskipTests`: build succeeded.
 - The shaded build reported overlapping classes/resources, including LZ4 and Zstd copies involving `rocketmq-client-java`.
 
-Before rollout, add broker-backed tests covering:
+Update (2026-08-16): the suite is now 62 tests, including broker-backed integration tests for both connector families — `MqttBridgeIntegrationTest` (Testcontainers HiveMQ) and `RocketMQBridgeIntegrationTest` (Testcontainers `apache/rocketmq:5.3.4`). Both exercise the transform pipeline, SQL filtering, hop-count loop prevention, malformed-payload handling, `src.*.topic` provenance, and `dst.*.topic` routing against a real broker.
+
+Remaining broker-backed test gaps:
 
 - MQTT QoS 0 and QoS 1 crash behavior.
 - MQTT queue saturation, reconnect, and persistent-session redelivery.

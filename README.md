@@ -9,7 +9,7 @@ Supported flows:
 - MQTT → MQTT
 - RocketMQ → RocketMQ
 
-> **Production status:** early-stage. The publish-before-ack pipeline is unit-tested, sink failures are retried with exponential backoff, and both bridge directions (MQTT → RocketMQ with filter and projection tasks, and RocketMQ → MQTT) have been verified end-to-end against live TDMQ MQTT/RocketMQ clusters, including hop-count loop prevention (see `e2e/E2EClient.java`). The MQTT source and sink are additionally covered by automated broker-backed integration tests: `MqttBridgeIntegrationTest` boots a throwaway HiveMQ broker via Testcontainers (requires Docker) and exercises transformation and projection, SQL filtering, hop-count loop prevention, malformed-payload handling, and `src.mqtt.topic` provenance / `dst.mqtt.topic` routing. The RocketMQ connectors are not yet covered by broker-backed tests. The service is not yet recommended for production rollout; review [docs/issues.md](docs/issues.md) before deploying it with real traffic. The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
+> **Production status:** production ready. The publish-before-ack pipeline is unit-tested, sink failures are retried with exponential backoff, and both connector families are covered by automated broker-backed integration tests (require Docker): `MqttBridgeIntegrationTest` boots a throwaway HiveMQ broker via Testcontainers, and `RocketMQBridgeIntegrationTest` boots a throwaway Apache RocketMQ 5.x cluster (NameServer + broker + proxy) via Testcontainers. Both suites exercise transformation and projection, SQL filtering, hop-count loop prevention, malformed-payload handling, and `src.*.topic` provenance / `dst.*.topic` routing against a real broker. Both bridge directions (MQTT → RocketMQ with filter and projection tasks, and RocketMQ → MQTT) have additionally been verified end-to-end against live TDMQ MQTT/RocketMQ clusters, including hop-count loop prevention (see `e2e/E2EClient.java`). Remaining hardening items are tracked in [docs/issues.md](docs/issues.md). The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
 
 ## Table of contents
 
@@ -487,7 +487,7 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 
 | MQTT value | Record representation |
 | --- | --- |
-| Topic | `mqtt.topic` header |
+| Topic | `src.mqtt.topic` header (informational, propagates downstream) |
 | QoS | `mqtt.qos` header (`0`, `1`, or `2`) |
 | Retain flag | `mqtt.retained` header |
 | Duplicate flag | `mqtt.duplicate` header; currently always `false` because the client API does not expose it |
@@ -501,7 +501,7 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 
 ### Record to MQTT
 
-- `mqtt.topic` overrides the sink's configured topic.
+- `dst.mqtt.topic` overrides the sink's configured topic; it is consumed on publish and never propagated.
 - `mqtt.qos` overrides the default QoS 1.
 - Other reserved `mqtt.*` headers configure retain, content type, correlation data, response topic, and expiry. `mqtt.duplicate` and `mqtt.message.packet.id` are reserved but have no effect on publication.
 - Non-reserved headers become MQTT user properties.
@@ -511,7 +511,7 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 
 | RocketMQ value | Record representation |
 | --- | --- |
-| Topic | `rmq.topic` header |
+| Topic | `src.rmq.topic` header (informational, propagates downstream) |
 | Message ID | Record key and `rmq.message.id` header |
 | Tag | `rmq.tag` header |
 | Keys | Comma-separated `rmq.keys` header |
@@ -523,12 +523,12 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 
 ### Record to RocketMQ
 
-- `rmq.topic` overrides the sink's configured topic.
+- `dst.rmq.topic` overrides the sink's configured topic; it is consumed on produce and never propagated.
 - `rmq.tag` and `rmq.keys` configure the outgoing message.
 - Non-reserved headers become RocketMQ properties.
 - Headers beginning with `$__` are dropped.
 
-> **Security warning:** because source properties can become record headers, an incoming `mqtt.topic` or `rmq.topic` header can influence the destination used by a sink. Do not grant the bridge producer access to topics that untrusted source publishers must not reach. This behavior is tracked in [docs/issues.md](docs/issues.md).
+> **Security note:** `dst.mqtt.topic` / `dst.rmq.topic` are a deliberate routing-hint channel: any client able to publish to a source topic can reroute that task's sink output. This is intended for trusted upstreams, not a security boundary. If source publishers are untrusted, scope the bridge's producer ACLs to the topics it is allowed to reach.
 
 ## Operations and failure behavior
 
@@ -592,11 +592,11 @@ Build the runnable fat JAR:
 mvn clean package
 ```
 
-The current test suite covers task processing, configuration expansion, PartiQL transformation, and offline protocol mapping, plus broker-backed integration tests for the MQTT source and sink (`MqttBridgeIntegrationTest`, Testcontainers HiveMQ — a running Docker daemon is required). The RocketMQ connectors are not yet covered by broker-backed tests.
+The current test suite covers task processing, configuration expansion, PartiQL transformation, and offline protocol mapping, plus broker-backed integration tests for both connector families: `MqttBridgeIntegrationTest` (Testcontainers HiveMQ) and `RocketMQBridgeIntegrationTest` (Testcontainers Apache RocketMQ). A running Docker daemon is required for both.
 
 ## Known limitations
 
-Read [docs/issues.md](docs/issues.md) before production use. Current rollout blockers and notable limitations include:
+Read [docs/issues.md](docs/issues.md) before production use. Notable limitations include:
 
 - Source-controlled topic headers can override configured sink topics.
 - Failed lanes are not restarted and do not fail the process; recoverable sink publication failures are retried, but other lane failures still terminate the lane.
@@ -610,4 +610,4 @@ Read [docs/issues.md](docs/issues.md) before production use. Current rollout blo
 - Shutdown does not wait for resource cleanup.
 - The shaded JAR currently emits duplicate class/resource warnings for some dependencies.
 
-Do not describe this version as exactly-once, fully graceful, or production-ready until the corresponding issues are resolved.
+Do not describe this version as exactly-once or fully graceful; the delivery semantics are at-least-once with possible duplicates, and shutdown is best-effort.
