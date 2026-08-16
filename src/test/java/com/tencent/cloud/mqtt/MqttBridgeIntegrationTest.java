@@ -149,6 +149,12 @@ class MqttBridgeIntegrationTest {
         }
     }
 
+    /** Asserts nothing arrives on the output topic within the negative window. */
+    private void assertNoMessage(Mqtt5Publishes publishes) throws Exception {
+        assertTrue(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).isEmpty(),
+            "unexpected message on sink topic");
+    }
+
     @Test
     void transformsAndPublishesMatchingRecord() throws Exception {
         startTask("happy-0", "it/happy/in",
@@ -185,5 +191,25 @@ class MqttBridgeIntegrationTest {
         assertTrue(body.contains("hot"), "only the matching record should be republished, got: " + body);
         assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
             "filtered record must not reach the sink");
+    }
+
+    @Test
+    void dropsRecordExceedingMaxHops() throws Exception {
+        startTask("loop-0", "it/loop/in",
+            "SELECT * FROM payload",
+            "it/loop/out", 1);
+        Mqtt5Publishes publishes = subscribeVerifier("verifier-loop", "it/loop/out");
+
+        publish("it/loop/in", "{\"marker\":\"over-limit\"}",
+            Task.HOP_COUNT_HEADER, "2");
+        publish("it/loop/in", "{\"marker\":\"fresh\"}");
+
+        Mqtt5Publish received = publishes.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS).orElse(null);
+        assertNotNull(received, "expected the fresh message");
+        String body = new String(received.getPayloadAsBytes(), StandardCharsets.UTF_8);
+        assertTrue(body.contains("fresh"), "over-limit record must be dropped, got: " + body);
+        assertEquals(Optional.of("1"), userProperty(received, Task.HOP_COUNT_HEADER));
+        assertNull(publishes.receive(NEGATIVE_WINDOW_MILLIS, TimeUnit.MILLISECONDS).orElse(null),
+            "over-limit record must not be republished");
     }
 }
