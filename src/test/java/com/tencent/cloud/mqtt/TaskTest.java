@@ -39,6 +39,10 @@ class TaskTest {
                 events.add("ack");
             }
         }
+
+        public String debugString() {
+            return "TestMessage";
+        }
     }
 
     static class FakeSource implements Source {
