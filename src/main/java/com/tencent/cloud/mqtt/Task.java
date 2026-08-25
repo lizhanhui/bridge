@@ -75,11 +75,13 @@ public class Task {
                 if (transformed.isPresent()) {
                     for (Record<String, String> result : transformed.get()) {
                         if (!publishWithRetry(result)) {
+                            log.error("Task {} failed to publish", name);
                             break;
                         }
+                        log.debug("Task {} published record[{}] to sink", name, record.debugString());
                     }
                 } else {
-                    log.debug("Task {} filters record[{}] out", name, record.debugString());
+                    log.info("Task {} filters record[{}] out", name, record.debugString());
                 }
                 record.ack();
             }
