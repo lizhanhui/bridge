@@ -65,8 +65,8 @@ public class Task {
             while ((record = source.poll()) != null) {
                 int hopCount = hopCount(record);
                 if (hopCount > maxHops) {
-                    log.info("Task {} dropping record: {}={} exceeds max_hops {}", name,
-                        HOP_COUNT_HEADER, hopCount, maxHops);
+                    log.info("Task {} dropping record[{}]: {}={} exceeds max_hops {}", name, record.debugString(),
+                            HOP_COUNT_HEADER, hopCount, maxHops);
                     record.ack();
                     continue;
                 }
@@ -78,6 +78,8 @@ public class Task {
                             break;
                         }
                     }
+                } else {
+                    log.debug("Task {} filters record[{}] out", name, record.debugString());
                 }
                 record.ack();
             }

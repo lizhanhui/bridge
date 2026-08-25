@@ -34,4 +34,8 @@ final class RocketMQAckableRecord extends AckableRecord {
                 messageView.getTopic(), e.getMessage());
         }
     }
+
+    public String debugString() {
+        return messageView.getTopic() + ":" + messageView.getMessageId();
+    }
 }
