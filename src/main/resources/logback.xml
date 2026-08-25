@@ -13,7 +13,7 @@
             <!-- daily rollover -->
             <fileNamePattern>archive/bridge.%d{yyyy-MM-dd}.gz</fileNamePattern>
 
-            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFileNamingAndTriggeringPolicy">
                 <!-- or whenever the file size reaches 128MB -->
                 <maxFileSize>128MB</maxFileSize>
             </timeBasedFileNamingAndTriggeringPolicy>
