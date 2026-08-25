@@ -65,8 +65,8 @@ public class Task {
             while ((record = source.poll()) != null) {
                 int hopCount = hopCount(record);
                 if (hopCount > maxHops) {
-                    log.info("Task {} dropping record: {}={} exceeds max_hops {}", name,
-                        HOP_COUNT_HEADER, hopCount, maxHops);
+                    log.info("Task {} dropping record[{}]: {}={} exceeds max_hops {}", name, record.debugString(),
+                            HOP_COUNT_HEADER, hopCount, maxHops);
                     record.ack();
                     continue;
                 }
@@ -75,9 +75,13 @@ public class Task {
                 if (transformed.isPresent()) {
                     for (Record<String, String> result : transformed.get()) {
                         if (!publishWithRetry(result)) {
+                            log.error("Task {} failed to publish", name);
                             break;
                         }
+                        log.debug("Task {} published record[{}] to sink", name, record.debugString());
                     }
+                } else {
+                    log.info("Task {} filters record[{}] out", name, record.debugString());
                 }
                 record.ack();
             }

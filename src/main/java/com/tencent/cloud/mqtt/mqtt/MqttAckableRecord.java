@@ -2,6 +2,7 @@ package com.tencent.cloud.mqtt.mqtt;
 
 import org.apache.kafka.streams.processor.api.Record;
 
+import com.hivemq.client.mqtt.mqtt5.datatypes.Mqtt5UserProperty;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import com.tencent.cloud.mqtt.AckableRecord;
 
@@ -18,5 +19,19 @@ final class MqttAckableRecord extends AckableRecord {
     @Override
     protected void doAck() {
         publish.acknowledge();
+    }
+
+    public String debugString() {
+        String msgId = null;
+        // Inspect Message ID from user properties
+        for (Mqtt5UserProperty property : publish.getUserProperties().asList()) {
+            String name = property.getName().toString();
+            if (MqttRecordMapper.USER_PROPERTY_MESSAGE_ID.equals(name)) {
+                msgId = property.getValue().toString();
+                break;
+            }
+        }
+
+        return publish.getTopic().toString() + ":" + msgId;
     }
 }

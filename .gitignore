@@ -43,3 +43,6 @@ build/
 dependency-reduced-pom.xml
 ### E2E ###
 e2e/classes/
+
+logs/
+conf/tasks.json

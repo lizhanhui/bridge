@@ -36,4 +36,6 @@ public abstract class AckableRecord extends Record<String, String> {
     }
 
     protected abstract void doAck();
+
+    protected abstract String debugString();
 }
