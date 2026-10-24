@@ -6,18 +6,22 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,6 +32,7 @@ import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -35,7 +40,12 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.AuthenticationException;
+import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.SaslAuthenticationException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
@@ -43,11 +53,12 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.streams.processor.api.Record;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.function.Executable;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.kafka.KafkaContainer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tencent.cloud.mqtt.SQLTransform;
@@ -61,7 +72,7 @@ import com.tencent.cloud.mqtt.model.ConnectorType;
 class KafkaSourceIntegrationTest {
 
     @Container
-    static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:3.7.0");
+    static final AuthenticatedKafkaContainer KAFKA = new AuthenticatedKafkaContainer();
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String SQL =
@@ -78,6 +89,114 @@ class KafkaSourceIntegrationTest {
     private KafkaConsumer<String, String> verifier;
     private KafkaSource source;
     private Thread taskThread;
+    private KafkaSource secondSource;
+    private Thread secondTaskThread;
+    private final AtomicReference<Throwable> secondTaskFailure = new AtomicReference<>();
+    private final List<RebalanceGateSink> rebalanceGates = new ArrayList<>();
+
+    @BeforeAll
+    static void verifyAuthenticatedReadiness() throws Exception {
+        try (AdminClient ready = AdminClient.create(KAFKA.clientProperties(Map.of(
+                "default.api.timeout.ms", 10_000, "request.timeout.ms", 5_000)))) {
+            assertFalse(ready.describeCluster().nodes().get(10, TimeUnit.SECONDS).isEmpty());
+            ready.listTopics().names().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void adminRejectsIncorrectPasswordWithNativeAuthenticationFailure() throws Exception {
+        Map<String, Object> properties = KAFKA.badPasswordProperties();
+        properties.put("default.api.timeout.ms", 10_000);
+        properties.put("request.timeout.ms", 5_000);
+        try (AdminClient rejected = AdminClient.create(properties)) {
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> rejected.describeCluster().nodes().get(10, TimeUnit.SECONDS));
+            assertAuthenticationCause(failure);
+        }
+    }
+
+    @Test
+    void sinkPublishRejectsIncorrectPasswordWithNativeAuthenticationFailure() throws Exception {
+        String suffix = suffix();
+        String topic = "it-auth-sink-" + suffix;
+        createTopics(topic);
+        Map<String, Object> properties = KAFKA.badPasswordProperties();
+        properties.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000);
+        properties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 10_000);
+        properties.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 10_000);
+        Connector connector = new Connector();
+        connector.setType(ConnectorType.Kafka);
+        connector.setProperties(properties);
+        KafkaSink rejected = new KafkaSink(connector, topic, "rejected-sink-" + suffix);
+        try {
+            AuthenticationException failure = assertThrows(AuthenticationException.class,
+                () -> rejected.publish(new Record<>("key", payload("auth", 25), System.currentTimeMillis())));
+            assertAuthenticationCause(failure);
+        } finally {
+            rejected.close();
+        }
+    }
+
+    @Test
+    void sourcePollRejectsIncorrectPasswordAndPreservesOwnerAuthenticationFailure() throws Exception {
+        String suffix = suffix();
+        String topic = "it-auth-source-" + suffix;
+        createTopics(topic);
+        Connector connector = connector("it-auth-group-" + suffix, KAFKA.badPasswordProperties());
+        connector.getProperties().put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 10_000);
+        connector.getProperties().put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000);
+        AtomicReference<Throwable> observedFailure = new AtomicReference<>();
+        AtomicReference<KafkaSource> rejected = new AtomicReference<>();
+        CountDownLatch stopped = new CountDownLatch(1);
+        Thread worker = Thread.ofVirtual().name("rejected-source-" + suffix).start(() -> {
+            try {
+                KafkaSource consumer = new KafkaSource(connector, List.of(topic), "rejected-" + suffix, 100);
+                rejected.set(consumer);
+                try {
+                    consumer.poll();
+                } catch (InterruptedException interrupted) {
+                    // The owner interrupts a waiting poll; its stored failure is checked first on the next poll.
+                    Thread.interrupted();
+                    try {
+                        consumer.poll();
+                    } finally {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            } catch (Throwable failure) {
+                observedFailure.set(failure);
+            } finally {
+                KafkaSource consumer = rejected.get();
+                if (consumer != null) {
+                    consumer.close();
+                }
+                stopped.countDown();
+            }
+        });
+        try {
+            assertTrue(stopped.await(15, TimeUnit.SECONDS), "bad-password source must fail within the bounded window");
+            assertAuthenticationCause(observedFailure.get());
+        } finally {
+            KafkaSource consumer = rejected.get();
+            if (consumer != null) {
+                consumer.close();
+            }
+            worker.interrupt();
+            worker.join(15_000);
+            assertFalse(worker.isAlive(), "rejected source worker and its owner must close");
+            assertFalse(Thread.currentThread().isInterrupted(), "source failure must not interrupt the test thread");
+        }
+    }
+
+    private static void assertAuthenticationCause(Throwable failure) {
+        assertNotNull(failure, "operation must fail rather than accept invalid credentials");
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SaslAuthenticationException) {
+                return;
+            }
+        }
+        fail("expected native SaslAuthenticationException in the original cause chain", failure);
+    }
 
     @Test
     void kafkaToKafkaTransformsBatchAndCommitsFilteredAndTombstoneOffsets() throws Exception {
@@ -96,8 +215,11 @@ class KafkaSourceIntegrationTest {
         send(input, "tombstone", null, timestamp, new RecordHeaders());
         RecordMetadata routedInput = send(input, "key-routed", payload("routed", 30), timestamp + 1,
             richHeaders(routed));
-        RecordMetadata lastInput = send(input, "over-limit", payload("over-limit", 35), timestamp,
+        send(input, "over-limit", payload("over-limit", 35), timestamp,
             new RecordHeaders().add(Task.HOP_COUNT_HEADER, utf8("2")));
+        send(input, "malformed", "{malformed-json", timestamp, new RecordHeaders());
+        RecordMetadata lastInput = send(input, "poison-routing", payload("poison-routing", 45), timestamp,
+            new RecordHeaders().add("dst.kafka.topic", utf8("invalid/topic")));
 
         // The same native properties can be reused by the source and sink connectors.
         Connector connector = connector(group, Map.of(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 20));
@@ -222,13 +344,165 @@ class KafkaSourceIntegrationTest {
         assertTaskHealthy();
     }
 
+    @Test
+    void realRebalanceFencesStaleCompletionAndReplaysMovedPartition() throws Exception {
+        String suffix = suffix();
+        String input = "it-rebalance-" + suffix + "-input";
+        String output = "it-rebalance-" + suffix + "-output";
+        String group = "it-rebalance-group-" + suffix;
+        String firstClient = "rebalance-first-" + suffix;
+        String secondClient = "rebalance-second-" + suffix;
+        TopicPartition retained = new TopicPartition(input, 0);
+        TopicPartition moved = new TopicPartition(input, 1);
+        createTopics(output);
+        admin.createTopics(List.of(new NewTopic(input, 2, (short) 1)
+            .configs(Map.of("message.timestamp.type", "CreateTime")))).all().get(30, TimeUnit.SECONDS);
+        createVerifier(output);
+        createPublisher();
+        Map<String, Object> overrides = Map.of(
+            ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, List.of(DeterministicRebalanceAssignor.class.getName()),
+            ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 10,
+            ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 6_000,
+            ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 1_000);
+        Connector connector = connector(group, overrides);
+        source = new KafkaSource(connector, List.of(input), firstClient, 100);
+        RebalanceGateSink oldSink = new RebalanceGateSink(new KafkaSink(connector, output, "old-sink-" + suffix), "moving");
+        rebalanceGates.add(oldSink);
+        startTask(oldSink);
+        awaitMemberAssignment(group, firstClient, Set.of(retained, moved), 1);
+        long timestamp = System.currentTimeMillis() - 60_000;
+        RecordMetadata retainedBefore = sendPartition(input, 0, "before-rebalance", payload("before-rebalance", 22),
+            timestamp - 1, new RecordHeaders());
+        assertOutput(receiveRecords(1).getFirst(), "before-rebalance", 44, "before-rebalance",
+            timestamp - 1, input, retainedBefore);
+        awaitCommitted(group, retained, retainedBefore.offset() + 1);
+        RecordMetadata unfinished = sendPartition(input, 1, "moving", payload("moving", 25), timestamp, new RecordHeaders());
+        assertTrue(oldSink.entered.await(30, TimeUnit.SECONDS), "old owner must stall the partition selected to move");
+        assertEquals("moving", oldSink.active.get().key());
+        assertEquals("1", new String(oldSink.active.get().headers().lastHeader("kafka.partition").value(), StandardCharsets.UTF_8));
+        assertNotCommittedPast(group, moved, unfinished.offset(), Duration.ofSeconds(1));
+
+        secondSource = new KafkaSource(connector, List.of(input), secondClient, 100);
+        RebalanceGateSink newSink = new RebalanceGateSink(new KafkaSink(connector, output, "new-sink-" + suffix), "moving");
+        rebalanceGates.add(newSink);
+        secondTaskThread = launchTask(secondSource, newSink, "rebalance-second-task-" + suffix, secondTaskFailure);
+        try {
+            awaitMemberAssignment(group, firstClient, Set.of(retained), 2);
+            awaitMemberAssignment(group, secondClient, Set.of(moved), 2);
+            assertTrue(newSink.entered.await(30, TimeUnit.SECONDS), "new owner must receive the uncommitted broker replay");
+            assertEquals("moving", newSink.active.get().key());
+            assertEquals(Long.toString(unfinished.offset()),
+                new String(newSink.active.get().headers().lastHeader("kafka.offset").value(), StandardCharsets.UTF_8));
+            assertNotCommittedPast(group, moved, unfinished.offset(), Duration.ofSeconds(1));
+
+            RecordMetadata retainedInput = sendPartition(input, 0, "retained", payload("retained", 30),
+                timestamp + 1, new RecordHeaders());
+            oldSink.release.countDown();
+            List<ConsumerRecord<String, String>> oldAndRetained = receiveRecords(2);
+            assertEquals(Set.of("moving", "retained"),
+                Set.copyOf(oldAndRetained.stream().map(ConsumerRecord::key).toList()));
+            for (ConsumerRecord<String, String> record : oldAndRetained) {
+                if (record.key().equals("moving")) {
+                    assertOutput(record, "moving", 50, "moving", timestamp, input, unfinished);
+                } else {
+                    assertOutput(record, "retained", 60, "retained", timestamp + 1, input, retainedInput);
+                }
+            }
+            // Processing and committing p0 proves the old lane already completed its stale p1 work.
+            awaitCommitted(group, retained, retainedInput.offset() + 1);
+            assertNotCommittedPast(group, moved, unfinished.offset(), NEGATIVE_WINDOW);
+            assertTrue(newSink.published.isEmpty(), "new-owner completion is still gated, so stale old ack cannot hide");
+            assertEquals(Set.of(moved), awaitMemberAssignment(group, secondClient, Set.of(moved), 2)
+                .assignment().topicPartitions());
+
+            newSink.release.countDown();
+            ConsumerRecord<String, String> replay = receiveRecords(1).getFirst();
+            assertOutput(replay, "moving", 50, "moving", timestamp, input, unfinished);
+            awaitCommitted(group, moved, unfinished.offset() + 1);
+            RecordMetadata continuing = sendPartition(input, 0, "continuing", payload("continuing", 35),
+                timestamp + 2, new RecordHeaders());
+            RecordMetadata follower = sendPartition(input, 1, "follower", payload("follower", 40),
+                timestamp + 3, new RecordHeaders());
+            List<ConsumerRecord<String, String>> progress = receiveRecords(2);
+            assertEquals(Set.of("continuing", "follower"), Set.copyOf(progress.stream().map(ConsumerRecord::key).toList()));
+            for (ConsumerRecord<String, String> record : progress) {
+                if (record.key().equals("continuing")) {
+                    assertOutput(record, "continuing", 70, "continuing", timestamp + 2, input, continuing);
+                } else {
+                    assertOutput(record, "follower", 80, "follower", timestamp + 3, input, follower);
+                }
+            }
+            awaitCommitted(group, retained, continuing.offset() + 1);
+            awaitCommitted(group, moved, follower.offset() + 1);
+            assertNoMoreRecords();
+        } finally {
+            oldSink.release.countDown();
+            newSink.release.countDown();
+        }
+    }
+
+    @Test
+    void readCommittedSkipsAbortedTransactionAndPreservesNativeOffsets() throws Exception {
+        String suffix = suffix();
+        String input = "it-transactions-" + suffix + "-input";
+        String output = "it-transactions-" + suffix + "-output";
+        String group = "it-transactions-group-" + suffix;
+        createTopics(input, output);
+        createVerifier(output);
+        createPublisher();
+        Map<String, Object> transactionalProperties = KAFKA.clientProperties(Map.of(
+            ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+            ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+            ProducerConfig.ACKS_CONFIG, "all",
+            ProducerConfig.TRANSACTIONAL_ID_CONFIG, "it-transaction-" + suffix,
+            ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, 30_000,
+            ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000,
+            ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000,
+            ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000));
+        long timestamp = System.currentTimeMillis() - 60_000;
+        RecordMetadata aborted;
+        RecordMetadata committedInput;
+        KafkaProducer<String, String> transactional = new KafkaProducer<>(transactionalProperties);
+        try {
+            transactional.initTransactions();
+            transactional.beginTransaction();
+            aborted = transactional.send(new ProducerRecord<>(input, 0, timestamp, "aborted",
+                payload("aborted", 25), new RecordHeaders())).get(30, TimeUnit.SECONDS);
+            transactional.abortTransaction();
+            transactional.beginTransaction();
+            committedInput = transactional.send(new ProducerRecord<>(input, 0, timestamp + 1, "committed",
+                payload("committed", 30), new RecordHeaders())).get(30, TimeUnit.SECONDS);
+            transactional.commitTransaction();
+        } finally {
+            transactional.close(Duration.ofSeconds(10));
+        }
+        RecordMetadata sentinel = send(input, "sentinel", payload("sentinel", 35), timestamp + 2, new RecordHeaders());
+        assertTrue(committedInput.offset() > aborted.offset(), "aborted transaction occupies native offsets");
+        assertTrue(sentinel.offset() > committedInput.offset() + 1, "commit control batch creates an offset gap");
+        Connector connector = connector(group, Map.of(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 20));
+        assertFalse(connector.getProperties().containsKey(ConsumerConfig.ISOLATION_LEVEL_CONFIG),
+            "this flow must exercise KafkaSource's default read_committed, not an explicit override");
+        source = new KafkaSource(connector, List.of(input), "transaction-source-" + suffix, 100);
+        startTask(new KafkaSink(connector, output, "transaction-sink-" + suffix));
+        List<ConsumerRecord<String, String>> records = receiveRecords(2);
+        assertEquals(Set.of("committed", "sentinel"), Set.copyOf(records.stream().map(ConsumerRecord::key).toList()));
+        for (ConsumerRecord<String, String> record : records) {
+            if (record.key().equals("committed")) {
+                assertOutput(record, "committed", 60, "committed", timestamp + 1, input, committedInput);
+            } else {
+                assertOutput(record, "sentinel", 70, "sentinel", timestamp + 2, input, sentinel);
+            }
+        }
+        awaitCommitted(group, new TopicPartition(input, 0), sentinel.offset() + 1);
+        assertNoMoreRecords();
+    }
+
     private static String suffix() {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
     private static Connector connector(String group, Map<String, Object> overrides) {
-        Map<String, Object> properties = new HashMap<>();
-        properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        Map<String, Object> properties = KAFKA.clientProperties();
         properties.put(ConsumerConfig.GROUP_ID_CONFIG, group);
         properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         properties.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30_000);
@@ -241,8 +515,8 @@ class KafkaSourceIntegrationTest {
     }
 
     private void createTopics(String... topics) throws Exception {
-        admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers(),
-            "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000));
+        admin = AdminClient.create(KAFKA.clientProperties(Map.of(
+            "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000)));
         List<NewTopic> definitions = new ArrayList<>();
         for (String topic : topics) {
             definitions.add(new NewTopic(topic, 1, (short) 1)
@@ -252,19 +526,24 @@ class KafkaSourceIntegrationTest {
     }
 
     private void createPublisher() {
-        publisher = new KafkaProducer<>(Map.of(
-            ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+        publisher = new KafkaProducer<>(KAFKA.clientProperties(Map.of(
             ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
             ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
             ProducerConfig.ACKS_CONFIG, "all",
             ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000,
             ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000,
-            ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000));
+            ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000)));
     }
 
     private RecordMetadata send(String topic, String key, String value, long timestamp, Headers headers)
             throws Exception {
         return publisher.send(new ProducerRecord<>(topic, 0, timestamp, key, value, headers))
+            .get(30, TimeUnit.SECONDS);
+    }
+
+    private RecordMetadata sendPartition(String topic, int partition, String key, String value,
+            long timestamp, Headers headers) throws Exception {
+        return publisher.send(new ProducerRecord<>(topic, partition, timestamp, key, value, headers))
             .get(30, TimeUnit.SECONDS);
     }
 
@@ -288,13 +567,12 @@ class KafkaSourceIntegrationTest {
     }
 
     private void createVerifier(String... topics) {
-        verifier = new KafkaConsumer<>(Map.of(
-            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+        verifier = new KafkaConsumer<>(KAFKA.clientProperties(Map.of(
             ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
             ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
             ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
             ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30_000,
-            ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000));
+            ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000)));
         List<TopicPartition> partitions = new ArrayList<>();
         for (String topic : topics) {
             partitions.add(new TopicPartition(topic, 0));
@@ -304,27 +582,32 @@ class KafkaSourceIntegrationTest {
     }
 
     private void startTask(Sink sink) {
+        shuttingDown.set(false);
+        taskThread = launchTask(source, sink, "task-kafka-source-integration", taskFailure);
+    }
+
+    private Thread launchTask(KafkaSource kafkaSource, Sink sink, String name,
+            AtomicReference<Throwable> laneFailure) {
         Task task;
         try {
-            task = new Task("integration", source, new SQLTransform<>(SQL), sink, 1);
+            task = new Task(name, kafkaSource, new SQLTransform<>(SQL), sink, 1);
         } catch (RuntimeException | Error failure) {
             try {
-                source.close();
+                kafkaSource.close();
             } finally {
                 sink.close();
             }
             throw failure;
         }
-        shuttingDown.set(false);
-        taskThread = Thread.ofVirtual().name("task-kafka-source-integration").start(() -> {
+        return Thread.ofVirtual().name(name).start(() -> {
             try {
                 task.launch();
                 if (!shuttingDown.get()) {
-                    taskFailure.compareAndSet(null, new IllegalStateException("lane exited before explicit shutdown"));
+                    laneFailure.compareAndSet(null, new IllegalStateException("lane exited before explicit shutdown"));
                 }
             } catch (InterruptedException failure) {
                 if (!shuttingDown.get()) {
-                    taskFailure.compareAndSet(null, failure);
+                    laneFailure.compareAndSet(null, failure);
                 }
                 Thread.currentThread().interrupt();
             } catch (Throwable failure) {
@@ -332,21 +615,36 @@ class KafkaSourceIntegrationTest {
                         && failure.getCause() instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 } else {
-                    taskFailure.compareAndSet(null, failure);
+                    laneFailure.compareAndSet(null, failure);
                 }
             }
         });
     }
 
-    private void stopTask() throws InterruptedException {
+    private void stopTask() {
         shuttingDown.set(true);
         if (taskThread != null) {
             taskThread.interrupt();
-            taskThread.join(15_000);
-            assertFalse(taskThread.isAlive(), "lane and consumer owner must stop within the bounded close timeout");
-            taskThread = null;
         }
-        assertTaskHealthy();
+        if (secondTaskThread != null) {
+            secondTaskThread.interrupt();
+        }
+        assertAll("both task lanes and owners must stop",
+            () -> {
+                if (taskThread != null) {
+                    taskThread.join(15_000);
+                    assertFalse(taskThread.isAlive(), "first lane and consumer owner must stop within close timeout");
+                    taskThread = null;
+                }
+            },
+            () -> {
+                if (secondTaskThread != null) {
+                    secondTaskThread.join(15_000);
+                    assertFalse(secondTaskThread.isAlive(), "second lane and consumer owner must stop within close timeout");
+                    secondTaskThread = null;
+                }
+            },
+            this::assertTaskHealthy);
     }
 
     private GateSink gate() {
@@ -377,6 +675,82 @@ class KafkaSourceIntegrationTest {
         @Override
         public void close() {
             release.countDown();
+        }
+    }
+
+    private static final class RebalanceGateSink implements Sink {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicReference<Record<String, String>> active = new AtomicReference<>();
+        final LinkedBlockingQueue<Record<String, String>> published = new LinkedBlockingQueue<>();
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private final KafkaSink delegate;
+        private final String gatedKey;
+
+        RebalanceGateSink(KafkaSink delegate, String gatedKey) {
+            this.delegate = delegate;
+            this.gatedKey = gatedKey;
+        }
+
+        @Override
+        public void publish(Record<String, String> record) {
+            if (gatedKey.equals(record.key())) {
+                active.set(record);
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(failure);
+                }
+            }
+            delegate.publish(record);
+            published.add(record);
+        }
+
+        @Override
+        public void close() {
+            release.countDown();
+            if (closed.compareAndSet(false, true)) {
+                delegate.close();
+            }
+        }
+    }
+
+    /** Native test assignor fixes the moved partition without relying on generated consumer member IDs. */
+    public static final class DeterministicRebalanceAssignor implements ConsumerPartitionAssignor, Configurable {
+        private String clientId;
+
+        @Override
+        public void configure(Map<String, ?> configs) {
+            clientId = (String) configs.get(ConsumerConfig.CLIENT_ID_CONFIG);
+        }
+
+        @Override
+        public ByteBuffer subscriptionUserData(Set<String> topics) {
+            return ByteBuffer.wrap(utf8(clientId));
+        }
+
+        @Override
+        public GroupAssignment assign(Cluster metadata, GroupSubscription subscription) {
+            List<Map.Entry<String, Subscription>> members = new ArrayList<>(subscription.groupSubscription().entrySet());
+            members.sort(Comparator.comparing(entry ->
+                StandardCharsets.UTF_8.decode(entry.getValue().userData().duplicate()).toString()));
+            String topic = members.getFirst().getValue().topics().getFirst();
+            Map<String, Assignment> assignments = new HashMap<>();
+            for (int member = 0; member < members.size(); member++) {
+                List<TopicPartition> partitions = new ArrayList<>();
+                for (int partition = member; partition < metadata.partitionCountForTopic(topic); partition += members.size()) {
+                    partitions.add(new TopicPartition(topic, partition));
+                }
+                assignments.put(members.get(member).getKey(), new Assignment(partitions));
+            }
+            return new GroupAssignment(assignments);
+        }
+
+        @Override
+        public String name() {
+            return "deterministic-rebalance-integration";
         }
     }
 
@@ -412,6 +786,34 @@ class KafkaSourceIntegrationTest {
             Thread.sleep(100);
         }
         fail("consumer did not obtain assignment for " + partition);
+        return null;
+    }
+
+    private MemberDescription awaitMemberAssignment(String group, String clientId,
+            Set<TopicPartition> expected, int memberCount) throws Exception {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            ConsumerGroupDescription description;
+            try {
+                description = describeGroup(group);
+            } catch (ExecutionException notYetCreated) {
+                if (!(notYetCreated.getCause() instanceof GroupIdNotFoundException)) {
+                    throw notYetCreated;
+                }
+                Thread.sleep(100);
+                continue;
+            }
+            if (description.members().size() == memberCount) {
+                for (MemberDescription member : description.members()) {
+                    if (member.clientId().equals(clientId) && member.assignment().topicPartitions().equals(expected)) {
+                        return member;
+                    }
+                }
+            }
+            Thread.sleep(100);
+        }
+        fail("consumer " + clientId + " did not obtain the deterministic assignment " + expected);
         return null;
     }
 
@@ -468,7 +870,10 @@ class KafkaSourceIntegrationTest {
 
     private void assertTaskHealthy() {
         if (taskFailure.get() != null) {
-            fail("task lane terminated unexpectedly", taskFailure.get());
+            fail("first task lane terminated unexpectedly", taskFailure.get());
+        }
+        if (secondTaskFailure.get() != null) {
+            fail("second task lane terminated unexpectedly", secondTaskFailure.get());
         }
     }
 
@@ -518,9 +923,20 @@ class KafkaSourceIntegrationTest {
                 for (GateSink sink : gates) {
                     sink.release.countDown();
                 }
+                for (RebalanceGateSink sink : rebalanceGates) {
+                    sink.release.countDown();
+                }
                 if (source != null) {
                     source.close();
                 }
+            },
+            () -> {
+                if (secondSource != null) {
+                    secondSource.close();
+                }
+            },
+            () -> {
+                assertAll(rebalanceGates.stream().map(sink -> (Executable) sink::close));
             },
             () -> {
                 if (publisher != null) {

@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -27,6 +28,7 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -36,6 +38,7 @@ import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.streams.processor.api.Record;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.rocketmq.client.apis.ClientConfiguration;
@@ -46,15 +49,18 @@ import org.apache.rocketmq.client.apis.message.MessageBuilder;
 import org.apache.rocketmq.client.apis.message.MessageView;
 import org.apache.rocketmq.client.apis.producer.Producer;
 import org.apache.rocketmq.client.apis.producer.SendReceipt;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
-import org.testcontainers.hivemq.HiveMQContainer;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.rocketmq.RocketMQContainer;
+import org.testcontainers.images.builder.Transferable;
 import org.testcontainers.utility.DockerImageName;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -65,7 +71,11 @@ import com.hivemq.client.mqtt.mqtt5.Mqtt5BlockingClient;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5BlockingClient.Mqtt5Publishes;
 import com.hivemq.client.mqtt.mqtt5.message.publish.Mqtt5Publish;
 import com.hivemq.client.mqtt.mqtt5.datatypes.Mqtt5UserProperties;
+import com.tencent.cloud.mqtt.kafka.AuthenticatedKafkaContainer;
 import com.tencent.cloud.mqtt.kafka.KafkaSink;
+import com.tencent.cloud.mqtt.kafka.KafkaSource;
+import com.tencent.cloud.mqtt.mqtt.MqttRecordMapper;
+import com.tencent.cloud.mqtt.mqtt.MqttSink;
 import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
 import com.tencent.cloud.mqtt.rocketmq.RocketMQSource;
@@ -75,11 +85,11 @@ import com.tencent.cloud.mqtt.rocketmq.RocketMQSource;
 class KafkaBridgeIntegrationTest {
 
     @Container
-    static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:3.7.0");
+    static final AuthenticatedKafkaContainer KAFKA = new AuthenticatedKafkaContainer();
 
-    @Container
-    static final HiveMQContainer HIVEMQ =
-        new HiveMQContainer(DockerImageName.parse("hivemq/hivemq-ce:2026.5"));
+    private static GenericContainer<?> mosquitto;
+    private static String externalMqttHost;
+    private static int externalMqttPort;
 
     @Container
     static final RocketMQContainer ROCKETMQ = new RocketMQContainer("apache/rocketmq:5.3.4");
@@ -104,6 +114,39 @@ class KafkaBridgeIntegrationTest {
     private Mqtt5BlockingClient mqttVerifier;
     private Mqtt5Publishes mqttPublishes;
     private SimpleConsumer rocketMqVerifier;
+    private SecondOutputGateSink fanOutSink;
+
+    @BeforeAll
+    static void verifyAuthenticatedReadiness() throws Exception {
+        String host = System.getProperty("bridge.it.mqtt.host");
+        String port = System.getProperty("bridge.it.mqtt.port");
+        if (host != null || port != null) {
+            if (host == null || port == null || host.isBlank()) {
+                throw new IllegalArgumentException("bridge.it.mqtt.host and bridge.it.mqtt.port must be set together with a nonblank host");
+            }
+            try {
+                externalMqttPort = Integer.parseInt(port);
+            } catch (NumberFormatException invalidPort) {
+                throw new IllegalArgumentException("bridge.it.mqtt.port must be an integer in 1..65535", invalidPort);
+            }
+            if (externalMqttPort < 1 || externalMqttPort > 65535) {
+                throw new IllegalArgumentException("bridge.it.mqtt.port must be in 1..65535");
+            }
+            externalMqttHost = host;
+        } else {
+            mosquitto = new GenericContainer<>(DockerImageName.parse(
+                "eclipse-mosquitto@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797"))
+                .withCopyToContainer(Transferable.of("listener 1883\nallow_anonymous true\n"),
+                    "/mosquitto/config/mosquitto.conf")
+                .withExposedPorts(1883).waitingFor(Wait.forListeningPort());
+            mosquitto.start();
+        }
+        try (AdminClient ready = AdminClient.create(KAFKA.clientProperties(Map.of(
+                "default.api.timeout.ms", 10_000, "request.timeout.ms", 5_000)))) {
+            assertFalse(ready.describeCluster().nodes().get(10, TimeUnit.SECONDS).isEmpty());
+            ready.listTopics().names().get(10, TimeUnit.SECONDS);
+        }
+    }
 
     @Test
     void mqttToKafkaTransformsAndPreservesMetadata() throws Exception {
@@ -117,7 +160,7 @@ class KafkaBridgeIntegrationTest {
         MAPPER.writeValue(config.toFile(), Map.of(
             "connectors", List.of(
                 Map.of("id", "mqtt", "type", "MQTT", "access_point",
-                    HIVEMQ.getHost() + ":" + HIVEMQ.getMqttPort()),
+                    mqttHost() + ":" + mqttPort()),
                 Map.of("id", "kafka", "type", "Kafka", "properties", kafkaProperties())),
             "tasks", List.of(Map.of(
                 "name", "mqtt-kafka-" + suffix,
@@ -128,12 +171,17 @@ class KafkaBridgeIntegrationTest {
 
         mqttPublisher = MqttClient.builder().useMqttVersion5()
             .identifier("publisher-" + suffix)
-            .serverHost(HIVEMQ.getHost()).serverPort(HIVEMQ.getMqttPort())
+            .serverHost(mqttHost()).serverPort(mqttPort())
             .buildBlocking();
         mqttPublisher.connect();
 
         long beforePublish = System.currentTimeMillis();
         publishMqtt(inputTopic, "cold", 5, "mqtt-filtered", null);
+        mqttPublisher.publishWith().topic(inputTopic).qos(MqttQos.AT_LEAST_ONCE)
+            .payload(utf8("{malformed-json")).send();
+        mqttPublisher.publishWith().topic(inputTopic).qos(MqttQos.AT_LEAST_ONCE)
+            .payload(payload("over-limit", 40)).userProperties(Mqtt5UserProperties.builder()
+                .add(Task.HOP_COUNT_HEADER, "2").build()).send();
         publishMqtt(inputTopic, "default", 25, "mqtt-default", null);
         publishMqtt(inputTopic, "routed", 30, "mqtt-routed", routedTopic);
 
@@ -247,7 +295,7 @@ class KafkaBridgeIntegrationTest {
         createKafkaTopics(inputTopic);
         createKafkaPublisher();
         mqttVerifier = MqttClient.builder().useMqttVersion5().identifier("verifier-" + suffix)
-            .serverHost(HIVEMQ.getHost()).serverPort(HIVEMQ.getMqttPort()).buildBlocking();
+            .serverHost(mqttHost()).serverPort(mqttPort()).buildBlocking();
         mqttVerifier.connect();
         mqttPublishes = mqttVerifier.publishes(MqttGlobalPublishFilter.ALL);
         mqttVerifier.subscribeWith().topicFilter(outputPrefix + "+").qos(MqttQos.AT_LEAST_ONCE).send();
@@ -261,12 +309,14 @@ class KafkaBridgeIntegrationTest {
                 .add("mqtt.content.type", utf8("application/json")));
         publishKafka(inputTopic, "over-limit", 40,
             kafkaInputHeaders(null, null).add(Task.HOP_COUNT_HEADER, utf8("2")));
+        publishKafkaRaw(inputTopic, "malformed", "{malformed-json", new RecordHeaders());
+        RecordMetadata lastInput = publishKafkaRaw(inputTopic, "tombstone", null, new RecordHeaders());
         Path config = temporaryDirectory.resolve("kafka-mqtt.json");
         MAPPER.writeValue(config.toFile(), Map.of(
             "connectors", List.of(
                 Map.of("id", "kafka", "type", "Kafka", "properties", kafkaSourceProperties(suffix)),
                 Map.of("id", "mqtt", "type", "MQTT", "access_point",
-                    HIVEMQ.getHost() + ":" + HIVEMQ.getMqttPort())),
+                    mqttHost() + ":" + mqttPort())),
             "tasks", List.of(Map.of(
                 "name", "kafka-mqtt-" + suffix,
                 "source", Map.of("connector_id", "kafka", "topics", List.of(inputTopic), "commit_interval_ms", 100),
@@ -295,11 +345,164 @@ class KafkaBridgeIntegrationTest {
         }
         assertEquals(Set.of(defaultTopic, routedTopic),
             Set.copyOf(messages.stream().map(message -> message.getTopic().toString()).toList()));
+        awaitCommitted("source-group-" + suffix, new TopicPartition(inputTopic, 0), lastInput.offset() + 1);
         long deadline = System.nanoTime() + NEGATIVE_WINDOW.toNanos();
         while (System.nanoTime() < deadline) {
             assertTaskHealthy();
             assertTrue(mqttPublishes.receive(250, TimeUnit.MILLISECONDS).isEmpty(),
-                "filtered/over-limit inputs and routing copies must not reach MQTT");
+                "filtered/over-limit/malformed/tombstone inputs and routing copies must not reach MQTT");
+        }
+    }
+
+    @Test
+    void kafkaToMqttPreservesProtocolPropertiesRetainedReplayAndHopBoundaries() throws Exception {
+        String suffix = uniqueSuffix();
+        String inputTopic = "it-kafka-properties-" + suffix;
+        String outputPrefix = "it/kafka-properties/" + suffix + "/";
+        String retainedTopic = outputPrefix + "retained";
+        String defaultTopic = outputPrefix + "default";
+        String responseTopic = outputPrefix + "response";
+        createKafkaTopics(inputTopic);
+        createKafkaPublisher();
+        mqttVerifier = MqttClient.builder().useMqttVersion5().identifier("properties-verifier-" + suffix)
+            .serverHost(mqttHost()).serverPort(mqttPort()).buildBlocking();
+        mqttVerifier.connect();
+        mqttPublishes = mqttVerifier.publishes(MqttGlobalPublishFilter.ALL);
+        mqttVerifier.subscribeWith().topicFilter(outputPrefix + "+").qos(MqttQos.AT_LEAST_ONCE)
+            .retainAsPublished(true).send();
+        mqttPublisher = MqttClient.builder().useMqttVersion5().identifier("retained-cleaner-" + suffix)
+            .serverHost(mqttHost()).serverPort(mqttPort()).buildBlocking();
+        mqttPublisher.connect();
+        try {
+            Headers boundaryHeaders = kafkaInputHeaders(MqttRecordMapper.H_DST_TOPIC, retainedTopic)
+                .add(Task.HOP_COUNT_HEADER, utf8("1"))
+                .add("label", utf8("blue")).add("label", utf8("green"))
+                .add(MqttRecordMapper.H_QOS, utf8("1"))
+                .add(MqttRecordMapper.H_RETAINED, utf8("true"))
+                .add(MqttRecordMapper.H_CONTENT_TYPE, utf8("application/json"))
+                .add(MqttRecordMapper.H_RESPONSE_TOPIC, utf8(responseTopic))
+                .add(MqttRecordMapper.H_CORRELATION_DATA, CORRELATION_DATA)
+                .add(MqttRecordMapper.H_MESSAGE_EXPIRY_INTERVAL, utf8("120"));
+            // MQTT has no record key field; no broker-assigned message-id property is synthesized.
+            RecordMetadata boundaryInput = publishKafkaRaw(inputTopic, null,
+                new String(payload("boundary", 25), StandardCharsets.UTF_8), boundaryHeaders);
+            RecordMetadata malformedHopInput = publishKafka(inputTopic, "malformed-hop", 30,
+                kafkaInputHeaders(null, null).add(Task.HOP_COUNT_HEADER, utf8("not-an-integer")));
+            RecordMetadata lastInput = publishKafka(inputTopic, "over-limit", 40,
+                kafkaInputHeaders(null, null).add(Task.HOP_COUNT_HEADER, utf8("2")));
+            Path config = temporaryDirectory.resolve("kafka-mqtt-properties.json");
+            MAPPER.writeValue(config.toFile(), Map.of(
+                "connectors", List.of(
+                    Map.of("id", "kafka", "type", "Kafka", "properties", kafkaSourceProperties(suffix)),
+                    Map.of("id", "mqtt", "type", "MQTT", "access_point", mqttHost() + ":" + mqttPort())),
+                "tasks", List.of(Map.of(
+                    "name", "kafka-mqtt-properties-" + suffix,
+                    "source", Map.of("connector_id", "kafka", "topics", List.of(inputTopic), "commit_interval_ms", 100),
+                    "sink", Map.of("connector_id", "mqtt", "topic", defaultTopic), "sql", SQL))));
+            startTask(TaskManager.loadTasks(config).getFirst());
+
+            List<Mqtt5Publish> messages = receiveMqttRecords(2);
+            Mqtt5Publish boundary = mqttOnTopic(messages, retainedTopic);
+            Mqtt5Publish malformedHop = mqttOnTopic(messages, defaultTopic);
+            assertEquals(MAPPER.valueToTree(Map.of("device", "boundary", "doubled", 50)),
+                MAPPER.readTree(boundary.getPayloadAsBytes()));
+            assertEquals(MAPPER.valueToTree(Map.of("device", "malformed-hop", "doubled", 60)),
+                MAPPER.readTree(malformedHop.getPayloadAsBytes()));
+            assertMqttSourceMetadata(boundary, inputTopic, boundaryInput, "2");
+            assertMqttSourceMetadata(malformedHop, inputTopic, malformedHopInput, "1");
+            assertEquals(List.of("blue", "green"), mqttPropertyValues(boundary, "label"));
+            assertMqttProtocolProperties(boundary, responseTopic);
+            assertTrue(boundary.isRetain(), "retain-as-published subscriber must observe the retained setting");
+            awaitCommitted("source-group-" + suffix, new TopicPartition(inputTopic, 0), lastInput.offset() + 1);
+            assertNoMoreMqttRecords();
+
+            Mqtt5BlockingClient replayClient = MqttClient.builder().useMqttVersion5()
+                .identifier("retained-replay-" + suffix).serverHost(mqttHost()).serverPort(mqttPort()).buildBlocking();
+            replayClient.connect();
+            try (Mqtt5Publishes replayPublishes = replayClient.publishes(MqttGlobalPublishFilter.ALL)) {
+                replayClient.subscribeWith().topicFilter(retainedTopic).qos(MqttQos.AT_LEAST_ONCE).send();
+                Mqtt5Publish replay = replayPublishes.receive(30, TimeUnit.SECONDS).orElseThrow();
+                assertTrue(replay.isRetain(), "new subscriber must receive the retained replay");
+                assertEquals(retainedTopic, replay.getTopic().toString());
+                assertEquals(MAPPER.readTree(boundary.getPayloadAsBytes()), MAPPER.readTree(replay.getPayloadAsBytes()));
+                assertMqttSourceMetadata(replay, inputTopic, boundaryInput, "2");
+                assertEquals(List.of("blue", "green"), mqttPropertyValues(replay, "label"));
+                assertMqttProtocolProperties(replay, responseTopic);
+                assertTrue(replayPublishes.receive(500, TimeUnit.MILLISECONDS).isEmpty(),
+                    "only one retained result exists on this unique topic");
+                assertTaskHealthy();
+            } finally {
+                replayClient.disconnect();
+            }
+        } finally {
+            // Stop the lane before clearing so an in-flight publish cannot repopulate retained state.
+            assertAll("stop retained publisher and clear only this unique topic",
+                this::stopTask,
+                () -> mqttPublisher.publishWith().topic(retainedTopic).qos(MqttQos.AT_LEAST_ONCE)
+                    .retain(true).payload(new byte[0]).send());
+        }
+    }
+
+    @Test
+    void kafkaToMqttFanOutCommitsOnlyAfterEveryOutputAndRecoverableRetry() throws Exception {
+        String suffix = uniqueSuffix();
+        String inputTopic = "it-kafka-fanout-" + suffix;
+        String outputTopic = "it/kafka-fanout/" + suffix;
+        String group = "source-group-" + suffix;
+        createKafkaTopics(inputTopic);
+        createKafkaPublisher();
+        mqttVerifier = MqttClient.builder().useMqttVersion5().identifier("fanout-verifier-" + suffix)
+            .serverHost(mqttHost()).serverPort(mqttPort()).buildBlocking();
+        mqttVerifier.connect();
+        mqttPublishes = mqttVerifier.publishes(MqttGlobalPublishFilter.ALL);
+        mqttVerifier.subscribeWith().topicFilter(outputTopic).qos(MqttQos.AT_LEAST_ONCE).send();
+        RecordMetadata input = publishKafkaRaw(inputTopic, "fanout",
+            "{\"readings\":[{\"amount\":5},{\"amount\":20},{\"amount\":30}]}", new RecordHeaders());
+        Connector sourceConnector = new Connector();
+        sourceConnector.setType(ConnectorType.Kafka);
+        sourceConnector.setProperties(kafkaSourceProperties(suffix));
+        Connector sinkConnector = new Connector();
+        sinkConnector.setType(ConnectorType.MQTT);
+        sinkConnector.setAccessPoint(mqttHost() + ":" + mqttPort());
+        SQLTransform<String, String> transform = new SQLTransform<>(
+            "SELECT * FROM payload.readings AS r WHERE r.amount > 10");
+        KafkaSource source = new KafkaSource(sourceConnector, List.of(inputTopic), "fanout-source-" + suffix, 100);
+        try {
+            fanOutSink = new SecondOutputGateSink(new MqttSink(sinkConnector, outputTopic, "fanout-sink-" + suffix));
+            startTask(new Task("kafka-mqtt-fanout-" + suffix, source, transform, fanOutSink, 1));
+        } catch (RuntimeException | Error failure) {
+            source.close();
+            if (fanOutSink != null) {
+                fanOutSink.close();
+            }
+            throw failure;
+        }
+        try (AdminClient admin = AdminClient.create(KAFKA.clientProperties(Map.of(
+                "default.api.timeout.ms", 10_000, "request.timeout.ms", 5_000)))) {
+            Mqtt5Publish first = receiveMqttRecords(1).getFirst();
+            assertEquals(outputTopic, first.getTopic().toString());
+            assertEquals(MAPPER.valueToTree(Map.of("amount", 20)), MAPPER.readTree(first.getPayloadAsBytes()));
+            assertTrue(fanOutSink.secondEntered.await(30, TimeUnit.SECONDS), "second SQL row must reach the gated sink");
+            long deadline = System.nanoTime() + NEGATIVE_WINDOW.toNanos();
+            while (System.nanoTime() < deadline) {
+                assertTaskHealthy();
+                assertTrue(taskThread.isAlive());
+                assertTrue(committed(admin, group, new TopicPartition(inputTopic, 0)) <= input.offset(),
+                    "first fan-out result alone must not acknowledge the input");
+                assertTrue(mqttPublishes.receive(100, TimeUnit.MILLISECONDS).isEmpty(),
+                    "second output remains blocked through its recoverable retry");
+            }
+            fanOutSink.release.countDown();
+            Mqtt5Publish second = receiveMqttRecords(1).getFirst();
+            assertEquals(outputTopic, second.getTopic().toString());
+            assertEquals(MAPPER.valueToTree(Map.of("amount", 30)), MAPPER.readTree(second.getPayloadAsBytes()));
+            assertMqttSourceMetadata(first, inputTopic, input, "1");
+            assertMqttSourceMetadata(second, inputTopic, input, "1");
+            assertTrue(fanOutSink.failedOnce.get(), "second-row first attempt exercised Task's recoverable retry");
+            awaitCommitted(group, new TopicPartition(inputTopic, 0), input.offset() + 1);
+            assertNoMoreMqttRecords();
+        } finally {
+            fanOutSink.release.countDown();
         }
     }
 
@@ -373,28 +576,42 @@ class KafkaBridgeIntegrationTest {
         }
     }
 
+    @AfterAll
+    static void stopOwnedMqttBroker() {
+        if (mosquitto != null) {
+            mosquitto.stop();
+        }
+    }
+
+    private static String mqttHost() {
+        return externalMqttHost == null ? mosquitto.getHost() : externalMqttHost;
+    }
+
+    private static int mqttPort() {
+        return externalMqttHost == null ? mosquitto.getMappedPort(1883) : externalMqttPort;
+    }
+
     private static String uniqueSuffix() {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
     private static Map<String, Object> kafkaProperties() {
-        return Map.of("bootstrap.servers", KAFKA.getBootstrapServers(),
-            "request.timeout.ms", 10_000, "delivery.timeout.ms", 30_000);
+        return KAFKA.clientProperties(Map.of(
+            "request.timeout.ms", 10_000, "delivery.timeout.ms", 30_000));
     }
 
     private static Map<String, Object> kafkaSourceProperties(String suffix) {
-        return Map.of("bootstrap.servers", KAFKA.getBootstrapServers(),
+        return KAFKA.clientProperties(Map.of(
             "group.id", "source-group-" + suffix, "auto.offset.reset", "earliest",
-            "max.poll.records", 20, "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000);
+            "max.poll.records", 20, "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000));
     }
 
     private void createKafkaPublisher() {
-        kafkaPublisher = new KafkaProducer<>(Map.of(
-            ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+        kafkaPublisher = new KafkaProducer<>(KAFKA.clientProperties(Map.of(
             ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
             ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
             ProducerConfig.ACKS_CONFIG, "all", ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000,
-            ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000, ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000));
+            ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000, ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000)));
     }
 
     private RecordMetadata publishKafka(String topic, String device, int temperature, Headers headers)
@@ -402,6 +619,37 @@ class KafkaBridgeIntegrationTest {
         return kafkaPublisher.send(new ProducerRecord<>(topic, 0, System.currentTimeMillis() - 60_000,
             "kafka-" + device, new String(payload(device, temperature), StandardCharsets.UTF_8), headers))
             .get(30, TimeUnit.SECONDS);
+    }
+
+    private RecordMetadata publishKafkaRaw(String topic, String key, String value, Headers headers)
+            throws Exception {
+        return kafkaPublisher.send(new ProducerRecord<>(topic, 0, System.currentTimeMillis(), key, value, headers))
+            .get(30, TimeUnit.SECONDS);
+    }
+
+    private void awaitCommitted(String group, TopicPartition partition, long expected) throws Exception {
+        try (AdminClient admin = AdminClient.create(KAFKA.clientProperties(Map.of(
+                "default.api.timeout.ms", 10_000, "request.timeout.ms", 5_000)))) {
+            long deadline = System.nanoTime() + RECEIVE_TIMEOUT.toNanos();
+            long actual = -1;
+            while (System.nanoTime() < deadline) {
+                assertTaskHealthy();
+                assertTrue(taskThread.isAlive(), "offset must advance while the Task is alive");
+                actual = committed(admin, group, partition);
+                assertTrue(actual <= expected, "source must not commit beyond its completed input");
+                if (actual == expected) {
+                    return;
+                }
+                Thread.sleep(100);
+            }
+            assertEquals(expected, actual, "live source must commit the final skipped input");
+        }
+    }
+
+    private static long committed(AdminClient admin, String group, TopicPartition partition) throws Exception {
+        OffsetAndMetadata offset = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata()
+            .get(10, TimeUnit.SECONDS).get(partition);
+        return offset == null ? -1 : offset.offset();
     }
 
     private static Headers kafkaInputHeaders(String routingHeader, String routedTopic) {
@@ -444,6 +692,49 @@ class KafkaBridgeIntegrationTest {
         return messages;
     }
 
+    private void assertNoMoreMqttRecords() throws Exception {
+        long deadline = System.nanoTime() + NEGATIVE_WINDOW.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            assertTrue(mqttPublishes.receive(250, TimeUnit.MILLISECONDS).isEmpty(),
+                "only the exact matching MQTT outputs may be published");
+        }
+    }
+
+    private static Mqtt5Publish mqttOnTopic(List<Mqtt5Publish> messages, String topic) {
+        List<Mqtt5Publish> matching = messages.stream()
+            .filter(message -> message.getTopic().toString().equals(topic)).toList();
+        assertEquals(1, matching.size(), "expected exactly one MQTT result on " + topic);
+        return matching.getFirst();
+    }
+
+    private static void assertMqttSourceMetadata(Mqtt5Publish message, String inputTopic,
+            RecordMetadata input, String hop) {
+        assertEquals(List.of(inputTopic), mqttPropertyValues(message, "src.kafka.topic"));
+        assertEquals(List.of(Integer.toString(input.partition())), mqttPropertyValues(message, "kafka.partition"));
+        assertEquals(List.of(Long.toString(input.offset())), mqttPropertyValues(message, "kafka.offset"));
+        assertEquals(List.of(hop), mqttPropertyValues(message, Task.HOP_COUNT_HEADER));
+        assertTrue(mqttPropertyValues(message, "dst.mqtt.topic").isEmpty());
+        assertTrue(mqttPropertyValues(message, "$__messageId").isEmpty());
+    }
+
+    private static void assertMqttProtocolProperties(Mqtt5Publish message, String responseTopic) {
+        assertEquals(MqttQos.AT_LEAST_ONCE, message.getQos());
+        assertEquals("application/json", message.getContentType().orElseThrow().toString());
+        assertEquals(responseTopic, message.getResponseTopic().orElseThrow().toString());
+        ByteBuffer correlation = message.getCorrelationData().orElseThrow().duplicate();
+        byte[] correlationBytes = new byte[correlation.remaining()];
+        correlation.get(correlationBytes);
+        assertArrayEquals(CORRELATION_DATA, correlationBytes);
+        long expiry = message.getMessageExpiryInterval().orElseThrow();
+        assertTrue(expiry > 0 && expiry <= 120, "expiry may decrease in flight but must remain positive");
+        for (String setting : List.of(MqttRecordMapper.H_QOS, MqttRecordMapper.H_RETAINED,
+                MqttRecordMapper.H_CONTENT_TYPE, MqttRecordMapper.H_RESPONSE_TOPIC,
+                MqttRecordMapper.H_CORRELATION_DATA, MqttRecordMapper.H_MESSAGE_EXPIRY_INTERVAL)) {
+            assertTrue(mqttPropertyValues(message, setting).isEmpty(), "protocol setting must not leak as user property");
+        }
+    }
+
     private static List<String> mqttPropertyValues(Mqtt5Publish message, String name) {
         return message.getUserProperties().asList().stream()
             .filter(property -> property.getName().toString().equals(name))
@@ -451,7 +742,8 @@ class KafkaBridgeIntegrationTest {
     }
 
     private static void createKafkaTopics(String... topics) throws Exception {
-        AdminClient admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()));
+        AdminClient admin = AdminClient.create(KAFKA.clientProperties(Map.of(
+            "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000)));
         try {
             List<NewTopic> newTopics = new ArrayList<>();
             for (String topic : topics) {
@@ -466,13 +758,12 @@ class KafkaBridgeIntegrationTest {
 
     private void createKafkaVerifier(String... topics) throws Exception {
         createKafkaTopics(topics);
-        verifier = new KafkaConsumer<>(Map.of(
-            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+        verifier = new KafkaConsumer<>(KAFKA.clientProperties(Map.of(
             ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
             ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
             ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
             ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30_000,
-            ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000));
+            ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000)));
         List<TopicPartition> partitions = new ArrayList<>();
         for (String topic : topics) {
             partitions.add(new TopicPartition(topic, 0));
@@ -612,15 +903,67 @@ class KafkaBridgeIntegrationTest {
         }
     }
 
+    private void stopTask() throws InterruptedException {
+        shuttingDown.set(true);
+        if (fanOutSink != null) {
+            fanOutSink.release.countDown();
+        }
+        if (taskThread != null) {
+            taskThread.interrupt();
+            taskThread.join(15_000);
+            assertFalse(taskThread.isAlive(), "task thread survived interrupt");
+            taskThread = null;
+        }
+        assertTaskHealthy();
+    }
+
+    private static final class SecondOutputGateSink implements Sink {
+        final CountDownLatch secondEntered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicBoolean failedOnce = new AtomicBoolean();
+        private final AtomicBoolean closed = new AtomicBoolean();
+        private final MqttSink delegate;
+        private boolean firstPublished;
+
+        SecondOutputGateSink(MqttSink delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void publish(Record<String, String> record) {
+            if (firstPublished) {
+                secondEntered.countDown();
+                if (failedOnce.compareAndSet(false, true)) {
+                    throw new IllegalStateException("test-only recoverable failure before second MQTT output");
+                }
+                try {
+                    release.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(interrupted);
+                }
+            }
+            delegate.publish(record);
+            firstPublished = true;
+        }
+
+        @Override
+        public void close() {
+            release.countDown();
+            if (closed.compareAndSet(false, true)) {
+                delegate.close();
+            }
+        }
+    }
+
     @AfterEach
     void tearDown() {
         shuttingDown.set(true);
         assertAll("stop lane and close all clients even if another cleanup fails",
+            this::stopTask,
             () -> {
-                if (taskThread != null) {
-                    taskThread.interrupt();
-                    taskThread.join(15_000);
-                    assertFalse(taskThread.isAlive(), "task thread survived interrupt");
+                if (fanOutSink != null) {
+                    fanOutSink.close();
                 }
             },
             () -> {

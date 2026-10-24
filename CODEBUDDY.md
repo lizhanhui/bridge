@@ -12,7 +12,7 @@ Early-stage Java (Maven) service that bridges MQTT brokers and RocketMQ: it cons
 - Entry point: `com.tencent.cloud.mqtt.TaskManager` — loads `conf/tasks.json` (or path from `args[0]`), builds connectors/tasks, runs each `Task` on its own virtual thread, with a shutdown hook that interrupts task threads
 - Tests: `mvn test` (JUnit 5 + Surefire); run a single test with `mvn test -Dtest=SQLTransformTest`
 - `MqttBridgeIntegrationTest` uses Testcontainers to spin up a HiveMQ broker (`hivemq/hivemq-ce`) — a running Docker daemon is required or those tests fail
-- `KafkaBridgeIntegrationTest` uses Kafka, HiveMQ, and RocketMQ containers to verify MQTT/RocketMQ↔Kafka flows; Docker and a free host port 8080 (custom RocketMQ container) are required
+- `KafkaBridgeIntegrationTest` uses authenticated Kafka, Mosquitto, and RocketMQ fixtures to verify MQTT/RocketMQ↔Kafka; Docker and free host port 8080 are required. `bridge.it.mqtt.host` + `bridge.it.mqtt.port` opt into an existing MQTT broker without modifying it. Kafka fixture clients use ephemeral SASL/PLAIN credentials; test-only INFO logging prevents Docker DEBUG credential dumps.
 - No lint tooling is configured yet
 - Compiler target is Java 25 — ensure the JDK matches before building
 - Run configuration is defined in `conf/tasks.json` (connectors + tasks)

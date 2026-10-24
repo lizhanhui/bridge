@@ -768,7 +768,46 @@ Build the runnable fat JAR:
 mvn clean package
 ```
 
-The test suite covers task processing, native Kafka configuration/defaults, producer/consumer completion, batching, rebalance, error and interruption behavior, PartiQL transformation, and offline protocol mapping. Broker-backed tests include `MqttBridgeIntegrationTest` (HiveMQ), `RocketMQBridgeIntegrationTest` (Apache RocketMQ), and `KafkaBridgeIntegrationTest` (MQTT/RocketMQ↔Kafka) and `KafkaSourceIntegrationTest` (Kafka-source offset/replay and polling behavior). A running Docker daemon is required for these suites. The custom RocketMQ container requires host port `8080` to be available. Testcontainers dependencies use a locally published snapshot; the Kafka module must be published under the same version as the other modules.
+The test suite includes unit-level configuration/mapping/concurrency checks and repeatable broker-backed tests: `MqttBridgeIntegrationTest` (HiveMQ), `RocketMQBridgeIntegrationTest` (Apache RocketMQ), `KafkaBridgeIntegrationTest` (Mosquitto/RocketMQ↔Kafka), and `KafkaSourceIntegrationTest` (Kafka-source behavior). Docker is required. The custom RocketMQ container requires host port `8080` to be free. Testcontainers modules use the same locally published snapshot version.
+
+### Authenticated Kafka integration tests
+
+The Kafka suites use an isolated Apache Kafka container whose externally exposed listener requires **SASL/PLAIN over SASL_PLAINTEXT**. Ephemeral credentials are generated per fixture, and every bridge connector, publisher, verifier and admin client uses native Kafka authentication settings. Incorrect-password checks exercise real admin, sink-publication and source-consumption RPCs and require a native authentication failure, not an arbitrary timeout.
+
+```sh
+mvn test -Dtest=KafkaBridgeIntegrationTest,KafkaSourceIntegrationTest
+```
+
+The default MQTT fixture is an isolated Mosquitto broker. To verify Kafka sink then source against an already-running MQTT broker, supply both explicit MQTT endpoint properties. The external broker is never started, stopped or reconfigured by the test:
+
+```sh
+mvn test -Dtest=KafkaBridgeIntegrationTest#mqttToKafkaTransformsAndPreservesMetadata \
+  -Dbridge.it.mqtt.host=127.0.0.1 -Dbridge.it.mqtt.port=15883
+mvn test -Dtest=KafkaBridgeIntegrationTest#kafkaToMqttTransformsRoutesAndPropagatesSourceProvenance \
+  -Dbridge.it.mqtt.host=127.0.0.1 -Dbridge.it.mqtt.port=15883
+```
+
+Kafka still runs in its authenticated test container for these commands; an existing standalone Kafka installation is not modified or implicitly treated as authenticated. Unique test topics/groups isolate traffic from existing applications. The external MQTT mode matches an anonymous MQTT5 listener; MQTT authentication/TLS need their own configured fixture and tests.
+
+Test logging uses `src/test/resources/logback-test.xml` with console INFO output to suppress Docker DEBUG command/HTTP-wire dumps that could expose server JAAS credentials. Production logging is unchanged. Do not enable Docker wire DEBUG when running credential-bearing fixtures, and do not publish private diagnostic logs.
+
+### End-to-end coverage boundaries
+
+The broker-backed cases check supported protocol directions, exact SQL projection/filter output, topic routing and consumed overrides, provenance/hop metadata, MQTT5 properties, Kafka header preservation, source completion offsets, tombstone handling, restart replay and group polling while processing is stalled. Additional feature cases exercise multi-row output, malformed input, hop boundaries, real consumer rebalances and transactional visibility; consult their named assertions rather than assuming every protocol property is losslessly interchangeable.
+
+| Behavior | Maintained broker-backed coverage |
+| --- | --- |
+| Kafka authentication | Successful authenticated bridge/admin/verifier traffic and rejected passwords for admin, sink and source |
+| MQTT↔Kafka data flow | Exact projection/filter results, routing overrides, source provenance, hop metadata and malformed-input suppression |
+| MQTT5 settings | QoS, content type, response topic, binary correlation data, expiry, duplicate user properties and retained replay/cleanup |
+| SQL fan-out/retry | Two real MQTT outputs with the second gated; source offset cannot advance before every output succeeds |
+| Kafka record fidelity | Original key/time and ordered duplicate/binary/null headers; authoritative source partition/offset metadata |
+| Source offsets/replay | Completed-prefix commits, tombstones, skipped records, blocked publication and restart of unfinished input |
+| Group ownership | Membership during stalled processing, real two-member reassignment, stale-completion fencing and retained-partition progress |
+| Transaction visibility | Default read-committed source excludes aborted transactions while preserving native offset gaps |
+| Other supported protocols | Existing MQTT/RocketMQ broker suites plus authenticated RocketMQ↔Kafka flows |
+
+SASL_PLAINTEXT proves authentication, **not encryption**. These tests do not establish SASL_SSL, SCRAM, mutual TLS, Kafka topic/group ACL enforcement, or MQTT authentication/TLS. They also do not simulate a full JVM crash or every broker/network failure. Unit tests remain the coverage for configuration rejection and hard-to-force ownership-loss/concurrency races. At-least-once replay and best-effort shutdown remain the documented delivery contract.
 
 ## Known limitations
 
