@@ -1,6 +1,6 @@
 # MQTT–RocketMQ–Kafka Bridge
 
-A Java service that consumes messages from MQTT or RocketMQ, transforms JSON payloads with PartiQL, and publishes the results to MQTT, RocketMQ, or Kafka.
+A Java service that consumes messages from MQTT, RocketMQ, or Kafka, transforms JSON payloads with PartiQL, and publishes the results to MQTT, RocketMQ, or Kafka.
 
 Supported flows:
 
@@ -10,6 +10,9 @@ Supported flows:
 - RocketMQ → RocketMQ
 - MQTT → Kafka
 - RocketMQ → Kafka
+- Kafka → MQTT
+- Kafka → RocketMQ
+- Kafka → Kafka
 
 > **Production status:** production ready. The publish-before-ack pipeline is unit-tested, sink failures are retried with exponential backoff, and both connector families are covered by automated broker-backed integration tests (require Docker): `MqttBridgeIntegrationTest` boots a throwaway HiveMQ broker via Testcontainers, and `RocketMQBridgeIntegrationTest` boots a throwaway Apache RocketMQ 5.x cluster (NameServer + broker + proxy) via Testcontainers. Both suites exercise transformation and projection, SQL filtering, hop-count loop prevention, malformed-payload handling, and `src.*.topic` provenance / `dst.*.topic` routing against a real broker. Both bridge directions (MQTT → RocketMQ with filter and projection tasks, and RocketMQ → MQTT) have additionally been verified end-to-end against live TDMQ MQTT/RocketMQ clusters, including hop-count loop prevention (see `e2e/E2EClient.java`). Remaining hardening items are tracked in [docs/issues.md](docs/issues.md). The checked-in sample configurations contain only template placeholders — supply real endpoints and credentials at deploy time and never commit them.
 
@@ -34,7 +37,7 @@ Supported flows:
 Each configured task is an independent **Source → Transform → Sink** pipeline:
 
 ```text
-MQTT or RocketMQ source
+MQTT, RocketMQ, or Kafka source
           │
           ▼
   Record<String, String>
@@ -50,7 +53,7 @@ MQTT or RocketMQ source
  MQTT, RocketMQ, or Kafka sink
 ```
 
-The source and sink are selected independently, so the same processing model supports the six flows above. Kafka is currently sink-only. A task can also be expanded into multiple processing lanes for higher throughput.
+The source and sink are selected independently, so the same processing model supports all nine source/sink combinations. A task can also be expanded into multiple processing lanes for higher throughput.
 
 The bridge intentionally uses a small set of core abstractions:
 
@@ -60,7 +63,7 @@ The bridge intentionally uses a small set of core abstractions:
 - `Task` coordinates processing and acknowledges the source only after processing completes.
 - `TaskManager` reads configuration, constructs lanes, starts virtual threads, and handles shutdown signals.
 
-Kafka brokers are required only for tasks targeting a Kafka sink. All flows reuse Kafka Streams' `Record` and Kafka's native header types; no Kafka Streams topology is involved.
+Kafka brokers are required only for tasks using a Kafka source or sink. All flows reuse Kafka Streams' `Record` and Kafka's native header types; no Kafka Streams topology is involved.
 
 ## Architecture
 
@@ -105,15 +108,18 @@ A query returning no rows filters the source record out; filtered records are ac
 - Waits for broker-confirmed delivery before the task acknowledges the source.
 - Defaults to `acks=all` and producer idempotence; delivery remains at-least-once across the bridge.
 - Closes with a bounded 10-second wait.
-- Supports sinks only, not Kafka sources or transactions.
+- Sources use a dedicated consumer-owner thread per lane, keeping polling active while sink processing runs.
+- Sources buffer one poll batch, process records sequentially, and batch only completed per-partition offsets for commit.
+- Source acknowledgement records in-memory completion; commits may lag and replay completed records after a crash/rebalance.
+- Transactions spanning source and sink are not supported.
 
 ## Prerequisites
 
 - JDK 25
 - Maven 3.x
-- Access to at least one MQTT 5 broker or RocketMQ 5.x proxy, depending on the configured flow
+- Access to the MQTT 5 broker, RocketMQ 5.x proxy, or Kafka brokers required by the configured flow
 - Existing RocketMQ topics and consumer groups as required by your broker environment
-- Kafka bootstrap endpoints and permission to publish to the destination topics when configuring a Kafka sink
+- Kafka bootstrap endpoints and permission to consume source topics/use groups or publish destination topics, as appropriate
 
 Verify the tools:
 
@@ -249,7 +255,7 @@ The root object contains `connectors` and `tasks` arrays:
 
 `access_point` must be a RocketMQ 5.x proxy endpoint accepted by the RocketMQ Java client.
 
-#### Kafka connector (sink-only)
+#### Kafka connector
 
 ```json
 {
@@ -275,7 +281,7 @@ Kafka uses **native Kafka property names** inside `properties`. It does not requ
 | `compression.type` | `none` | Kafka default; `lz4` is one optional choice. |
 | `security.protocol` | `PLAINTEXT` | Kafka default; explicitly configure TLS/SASL for secured clusters. |
 
-Other settings retain Kafka's defaults and may be supplied using their native names. Overrides must remain consistent with Kafka's idempotence constraints; invalid combinations fail at startup. Key and value serializers are bridge-owned `StringSerializer` instances (UTF-8 by default); `key.serializer` and `value.serializer` overrides are rejected. Transactions are not supported, so `transactional.id` is rejected. A Kafka connector cannot be used as a source.
+Other settings retain Kafka's defaults and may be supplied using their native names. Overrides must remain consistent with Kafka's idempotence constraints; invalid combinations fail at startup. Key and value serializers are bridge-owned `StringSerializer` instances (UTF-8 by default); `key.serializer` and `value.serializer` overrides are rejected. Kafka sink transactions are not supported, so `transactional.id` is rejected when constructing a producer. Source-specific settings and restrictions are described below.
 
 Authentication is configured entirely through native Kafka properties; top-level `username`/`password` are not translated for Kafka. For example, a SASL/PLAIN connection over TLS uses:
 
@@ -332,6 +338,52 @@ Task names must produce unique lane names. For example, two tasks named `events`
 | `connector_id` | Yes | ID of a `RocketMQ` connector. |
 | `consumer_group` | Yes | Consumer group used by every lane of this task. |
 | `topics` | Yes | Non-empty array of subscribed topics. |
+
+### Kafka source
+
+```json
+{
+  "id": "kafka-source",
+  "type": "Kafka",
+  "properties": {
+    "bootstrap.servers": "kafka:9092",
+    "group.id": "bridge-workers",
+    "auto.offset.reset": "earliest"
+  }
+}
+```
+
+Kafka sources require a nonblank native `group.id` and an **explicit** `auto.offset.reset` under connector `properties`. Choose `earliest` for retained backlog, `latest` for future-only consumption, or another policy accepted by Kafka. This applies when no usable committed offset exists; normal restarts resume committed offsets. The bridge does not choose this policy for you.
+
+```json
+{
+  "connector_id": "kafka-source",
+  "topics": ["sensor-events", "device-events"],
+  "commit_interval_ms": 1000
+}
+```
+
+| Source field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `connector_id` | Yes | — | Kafka connector ID. |
+| `topics` | Yes | — | Nonempty array of valid exact topic names; no regex or manual partition assignments. |
+| `commit_interval_ms` | No | `1000` | Positive integer interval for batching **completed** offsets; not Kafka's `auto.commit.interval.ms`. |
+
+| Consumer property | Default | Notes |
+| --- | --- | --- |
+| `group.id` | Required | Source tasks sharing this group compete for records. |
+| `auto.offset.reset` | Explicit choice required | No implicit earliest/latest policy. |
+| `client.id` | `source-<task-name>-<lane>` | Native override allowed. |
+| `enable.auto.commit` | `false` | `true` is rejected; unprocessed records must not be committed. |
+| `isolation.level` | `read_committed` | Avoids forwarding aborted transactions; native `read_uncommitted` override allowed. |
+| `max.poll.records` | `500` | Native default, configurable; bounds each handoff batch, not the client fetch cache. |
+| `group.protocol` | `classic` | Only the classic protocol is supported initially. |
+
+Key/value deserializers are bridge-owned `StringDeserializer` instances (UTF-8 by default); overrides are rejected. Static `group.instance.id` and nonempty consumer `interceptor.classes` are not supported initially: static identities can fence parallel lanes, and mutating interceptors can invalidate offset/order assumptions. Other native consumer settings, including security and fetch tuning, are retained and validated by Kafka.
+
+A connector can be reused as a source and sink with compatible native settings. Each client copies properties and applies its own defaults/restrictions; opposite-role settings may produce unused-key logs. Use separate connectors for role-specific plugins, different explicit `client.id` values, or different consumer groups. Sharing a source connector across SQL tasks does **not** create independent fan-out: each independent pipeline needs a different `group.id`.
+
+Null-valued Kafka tombstones are warned about and skipped using completed-offset accounting. They do not enter SQL or propagate as deletions.
 
 ### MQTT sink
 
@@ -531,6 +583,10 @@ Different shared-subscription groups each receive their own copy of matching tra
 
 RocketMQ lanes use the task's `consumer_group`. Lanes with the same group load-balance messages natively.
 
+### Kafka sources
+
+Lanes use the native `group.id` and load-balance assigned partitions. More lanes than partitions leave extra lanes idle. Processing is sequential per lane; ordering across partitions/lanes is not guaranteed. A slow sink blocks that lane's buffered and newly assigned records while the owner keeps polling paused partitions. Increase partitions and parallelism for concurrency.
+
 Each lane creates separate source and sink clients, so increasing parallelism also increases broker connections and resource use.
 
 ## Delivery and acknowledgement semantics
@@ -543,12 +599,16 @@ The bridge is designed for at-least-once processing on acknowledgement-capable p
 - A recoverable sink failure is retried indefinitely before acknowledgement; the source record remains unacknowledged while retries continue.
 - A sink validation failure (`IllegalArgumentException`) is treated as a poison record: the failing output and remaining outputs from that source record are skipped, a warning is logged, and the source record is acknowledged.
 - Source acknowledgements are idempotent within one process.
+- Kafka source `ack()` marks processing complete in memory, not a durable broker commit. The owner periodically commits only completed per-partition prefixes; queued/unfinished offsets are never committed. Shutdown/revocation attempts a best-effort final completed-prefix flush.
+- Kafka tombstones are skipped and marked complete without SQL evaluation.
 
 This design allows duplicates. For example:
 
 - If two output rows are published and the third publish keeps failing, the unacknowledged source record can be redelivered and all rows generated again.
 - If `sink.publish` throws after the broker already accepted the message (for example, a client-side timeout or connection drop), the in-process retry republishes the message, producing a duplicate at the sink without any redelivery.
 - On RocketMQ sources, a lane still retrying past the 30-second invisible duration lets another lane in the same consumer group receive and process the same message concurrently; both lanes eventually ack.
+
+Kafka source records published since the last successful batched commit can replay after a crash, failed flush, or rebalance. The commit interval is a scheduling target, not a maximum replay bound during commit failures. A revoked partition can replay elsewhere while old sink work finishes; a stale acknowledgement never commits into the new assignment.
 
 Sink consumers should therefore be idempotent when duplicate delivery matters.
 
@@ -618,11 +678,23 @@ The bridge preserves protocol metadata in record headers. PartiQL changes the va
 - Non-reserved headers become RocketMQ properties.
 - Headers beginning with `$__` are dropped.
 
+### Kafka to record
+
+| Kafka value | Record representation |
+| --- | --- |
+| Key/value | Original strings; null keys retained; null-valued tombstones skipped by the source |
+| Timestamp | Original nonnegative timestamp; receive time when Kafka reports no/negative timestamp |
+| Topic | Authoritative `src.kafka.topic` header |
+| Partition/offset | Authoritative decimal `kafka.partition` / `kafka.offset` headers and private ack context |
+| Headers | Ordered same-name headers with duplicate/binary/null values preserved and byte arrays copied |
+
+Only upstream copies of the three generated metadata names are replaced. Other `kafka.*`, cross-protocol metadata, `$__*`, hop counts and `dst.*` hints remain unchanged. Partition/offset headers are informational, not destination partition routing. MQTT/RocketMQ sinks keep their existing string-property/protocol constraints.
+
 ### Record to Kafka
 
 - Preserve the string key and transformed value, using string serializers (UTF-8 by default).
-- Preserve the record timestamp: MQTT receive time or RocketMQ born time. Kafka broker timestamp policies still apply.
-- Leave partition selection to Kafka. Source message IDs are keys, not business-entity keys, so this does not establish per-device ordering.
+- Preserve the record timestamp: MQTT receive time, RocketMQ born time, or the incoming Kafka timestamp. Kafka broker timestamp policies still apply.
+- Leave partition selection to Kafka. MQTT/RocketMQ keys are message IDs; Kafka source keys are preserved. Ordering depends on source partitions and lane/producer configuration.
 - Preserve header order, duplicate names, binary values, and null values, including `src.*.topic`, `bridge-hop-count`, and MQTT/RocketMQ metadata.
 - Unlike MQTT/RocketMQ outbound mapping, retain `$__*` source annotations as metadata; Kafka does not regenerate MQTT broker annotations.
 - The last `dst.kafka.topic` header overrides the configured topic; a null value falls back to the configured topic. All copies of this routing header are omitted from the outgoing headers without mutating the input record.
@@ -649,9 +721,11 @@ Each MQTT source lane has a bounded queue of 10,000 records. When the queue rema
 
 RocketMQ receives one message at a time per lane and does not use the MQTT queue.
 
+Kafka sources buffer at most one returned poll batch including its active record, bounded by native `max.poll.records`. The owner pauses assigned partitions while work is outstanding and continues polling for membership/rebalances. Native `fetch.*` settings govern extra fetch-cache memory. Transient commit failures retain completed offsets for a later fresh, lease-validated commit; authentication, authorization, fencing or unexpected consumer errors stop the lane and interrupt its processing thread.
+
 ### Shutdown
 
-On shutdown, all lane threads are interrupted. Interrupting a lane also interrupts any in-progress sink retry backoff. Each lane then attempts to close its source followed by its sink. The shutdown hook does not wait for cleanup, so allow the process an external termination grace period and do not assume every close operation completes.
+On shutdown, all lane threads are interrupted. Interrupting a lane also interrupts any in-progress sink retry backoff. Each lane then attempts to close its source followed by its sink. Kafka source close wakes the owner and best-effort flushes completed offsets before bounded cleanup; queued/unfinished records are never committed. The shutdown hook does not wait for cleanup, so allow the process an external termination grace period and do not assume every close operation completes.
 
 ### Logging
 
@@ -694,7 +768,7 @@ Build the runnable fat JAR:
 mvn clean package
 ```
 
-The test suite covers task processing, native Kafka configuration/defaults, producer completion/error/interrupt behavior, PartiQL transformation, and offline protocol mapping. Broker-backed tests include `MqttBridgeIntegrationTest` (HiveMQ), `RocketMQBridgeIntegrationTest` (Apache RocketMQ), and `KafkaBridgeIntegrationTest` (MQTT→Kafka and RocketMQ→Kafka). A running Docker daemon is required for these suites. The custom RocketMQ container requires host port `8080` to be available. Testcontainers dependencies use a locally published snapshot; the Kafka module must be published under the same version as the other modules.
+The test suite covers task processing, native Kafka configuration/defaults, producer/consumer completion, batching, rebalance, error and interruption behavior, PartiQL transformation, and offline protocol mapping. Broker-backed tests include `MqttBridgeIntegrationTest` (HiveMQ), `RocketMQBridgeIntegrationTest` (Apache RocketMQ), and `KafkaBridgeIntegrationTest` (MQTT/RocketMQ↔Kafka) and `KafkaSourceIntegrationTest` (Kafka-source offset/replay and polling behavior). A running Docker daemon is required for these suites. The custom RocketMQ container requires host port `8080` to be available. Testcontainers dependencies use a locally published snapshot; the Kafka module must be published under the same version as the other modules.
 
 ## Known limitations
 
@@ -706,7 +780,9 @@ Read [docs/issues.md](docs/issues.md) before production use. Notable limitations
 - RocketMQ's 30-second invisibility period is fixed and not renewed.
 - MQTT QoS 0 is outside the at-least-once guarantee.
 - MQTT TLS is inferred only from port `8883`.
-- Configuration validation is permissive.
+- Configuration validation is permissive outside Kafka-specific validated fields.
+- Kafka batched commits can replay completed records; source tombstones are deliberately skipped.
+- Kafka sources initially support only classic groups without static membership or consumer interceptors.
 - Malformed payloads are acknowledged and logged in full.
 - Transform output has no row, byte, or memory limit.
 - Shutdown does not wait for resource cleanup.

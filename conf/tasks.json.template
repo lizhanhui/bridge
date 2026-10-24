@@ -7,7 +7,6 @@
             "username": "<mqtt-username>",
             "password": "<mqtt-password>"
         },
-
         {
             "id": "rmq-example",
             "type": "RocketMQ",
@@ -19,7 +18,9 @@
             "id": "kafka-example",
             "type": "Kafka",
             "properties": {
-                "bootstrap.servers": "kafka:9092"
+                "bootstrap.servers": "kafka:9092",
+                "group.id": "bridge-workers",
+                "auto.offset.reset": "earliest"
             }
         }
     ],
@@ -85,12 +86,57 @@
             "source": {
                 "connector_id": "rmq-example",
                 "consumer_group": "kafka-workers",
-                "topics": ["home"]
+                "topics": [
+                    "home"
+                ]
             },
             "sql": "SELECT * FROM payload",
             "sink": {
                 "connector_id": "kafka-example",
                 "topic": "rocketmq-events"
+            }
+        },
+        {
+            "name": "kafka2mqtt-task",
+            "source": {
+                "connector_id": "kafka-example",
+                "topics": [
+                    "sensor-events"
+                ],
+                "commit_interval_ms": 1000
+            },
+            "sql": "SELECT payload.deviceId, payload.temperature FROM payload",
+            "sink": {
+                "connector_id": "mqtt-example",
+                "topic": "processed/sensors"
+            }
+        },
+        {
+            "name": "kafka2rmq-task",
+            "source": {
+                "connector_id": "kafka-example",
+                "topics": [
+                    "device-events"
+                ]
+            },
+            "sql": "SELECT * FROM payload",
+            "sink": {
+                "connector_id": "rmq-example",
+                "topic": "home"
+            }
+        },
+        {
+            "name": "kafka2kafka-task",
+            "source": {
+                "connector_id": "kafka-example",
+                "topics": [
+                    "raw-events"
+                ]
+            },
+            "sql": "SELECT * FROM payload WHERE payload.enabled = true",
+            "sink": {
+                "connector_id": "kafka-example",
+                "topic": "processed-events"
             }
         }
     ]

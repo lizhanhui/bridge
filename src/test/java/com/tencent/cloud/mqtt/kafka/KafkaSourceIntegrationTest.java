@@ -1,0 +1,542 @@
+package com.tencent.cloud.mqtt.kafka;
+
+import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.streams.processor.api.Record;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tencent.cloud.mqtt.SQLTransform;
+import com.tencent.cloud.mqtt.Sink;
+import com.tencent.cloud.mqtt.Task;
+import com.tencent.cloud.mqtt.model.Connector;
+import com.tencent.cloud.mqtt.model.ConnectorType;
+
+@Testcontainers
+@Timeout(120)
+class KafkaSourceIntegrationTest {
+
+    @Container
+    static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:3.7.0");
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String SQL =
+        "SELECT payload.device AS device, payload.temp * 2 AS doubled FROM payload WHERE payload.temp > 20";
+    private static final Duration WAIT = Duration.ofSeconds(30);
+    private static final Duration NEGATIVE_WINDOW = Duration.ofSeconds(3);
+    private static final byte[] BINARY_HEADER = {0, (byte) 0xff, 42, (byte) 0x80};
+
+    private final AtomicReference<Throwable> taskFailure = new AtomicReference<>();
+    private final AtomicBoolean shuttingDown = new AtomicBoolean();
+    private final List<GateSink> gates = new ArrayList<>();
+    private AdminClient admin;
+    private KafkaProducer<String, String> publisher;
+    private KafkaConsumer<String, String> verifier;
+    private KafkaSource source;
+    private Thread taskThread;
+
+    @Test
+    void kafkaToKafkaTransformsBatchAndCommitsFilteredAndTombstoneOffsets() throws Exception {
+        String suffix = suffix();
+        String input = "it-source-" + suffix + "-input";
+        String output = "it-source-" + suffix + "-default";
+        String routed = "it-source-" + suffix + "-routed";
+        String group = "it-source-" + suffix;
+        createTopics(input, output, routed);
+        createVerifier(output, routed);
+        createPublisher();
+        long timestamp = System.currentTimeMillis() - 60_000;
+        send(input, "filtered", payload("filtered", 5), timestamp, new RecordHeaders());
+        RecordMetadata defaultInput = send(input, "key-default", payload("default", 25), timestamp,
+            richHeaders(null));
+        send(input, "tombstone", null, timestamp, new RecordHeaders());
+        RecordMetadata routedInput = send(input, "key-routed", payload("routed", 30), timestamp + 1,
+            richHeaders(routed));
+        RecordMetadata lastInput = send(input, "over-limit", payload("over-limit", 35), timestamp,
+            new RecordHeaders().add(Task.HOP_COUNT_HEADER, utf8("2")));
+
+        // The same native properties can be reused by the source and sink connectors.
+        Connector connector = connector(group, Map.of(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 20));
+        source = new KafkaSource(connector, List.of(input), "source-" + suffix, 100);
+        startTask(new KafkaSink(connector, output, "sink-" + suffix));
+
+        List<ConsumerRecord<String, String>> records = receiveRecords(2);
+        ConsumerRecord<String, String> defaultRecord = onTopic(records, output);
+        ConsumerRecord<String, String> routedRecord = onTopic(records, routed);
+        assertOutput(defaultRecord, "default", 50, "key-default", timestamp, input, defaultInput);
+        assertOutput(routedRecord, "routed", 60, "key-routed", timestamp + 1, input, routedInput);
+        for (ConsumerRecord<String, String> record : records) {
+            assertEquals(List.of("blue", "green"), headerValues(record, "label"));
+            assertArrayEquals(BINARY_HEADER, record.headers().lastHeader("binary").value());
+            assertNotNull(record.headers().lastHeader("nullable"));
+            assertNull(record.headers().lastHeader("nullable").value());
+            assertEquals("upstream-message", header(record, "$__messageId"));
+            assertEquals("upstream-publisher", header(record, "$__publisherClientId"));
+            assertEquals("upstream/mqtt", header(record, "src.mqtt.topic"));
+            assertEquals("upstream-rmq", header(record, "src.rmq.topic"));
+            assertNull(record.headers().lastHeader("dst.kafka.topic"), "routing override is consumed");
+        }
+        awaitCommitted(group, new TopicPartition(input, 0), lastInput.offset() + 1);
+        assertNoMoreRecords();
+    }
+
+    @Test
+    void commitsOnlyAfterSinkCompletionAndRestartReplaysOnlyUnfinishedInput() throws Exception {
+        String suffix = suffix();
+        String input = "it-offsets-" + suffix;
+        String group = "it-offsets-group-" + suffix;
+        TopicPartition partition = new TopicPartition(input, 0);
+        createTopics(input);
+        createPublisher();
+        send(input, "first", payload("first", 25), System.currentTimeMillis(), new RecordHeaders());
+        send(input, "buffered-tombstone", null, System.currentTimeMillis(), new RecordHeaders());
+        RecordMetadata second = send(input, "second", payload("second", 30),
+            System.currentTimeMillis(), new RecordHeaders());
+        Connector connector = connector(group, Map.of(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 20));
+        GateSink firstSink = gate();
+        source = new KafkaSource(connector, List.of(input), "source-first-" + suffix, 100);
+        startTask(firstSink);
+        assertTrue(firstSink.entered.await(30, TimeUnit.SECONDS), "first input must reach the blocked sink");
+        assertEquals("first", firstSink.active.get().key());
+        awaitAssigned(group, partition);
+        assertNotCommittedPast(group, partition, 0, Duration.ofSeconds(1));
+        assertTrue(firstSink.published.isEmpty(), "unfinished input has not been published");
+
+        firstSink.release.countDown();
+        assertEquals("first", receivePublished(firstSink).key());
+        assertEquals("second", receivePublished(firstSink).key());
+        awaitCommitted(group, partition, second.offset() + 1);
+        stopTask();
+
+        GateSink unfinishedSink = gate();
+        source = new KafkaSource(connector, List.of(input), "source-restart-" + suffix, 100);
+        startTask(unfinishedSink);
+        awaitAssigned(group, partition);
+        RecordMetadata unfinished = send(input, "unfinished", payload("unfinished", 40),
+            System.currentTimeMillis(), new RecordHeaders());
+        assertTrue(unfinishedSink.entered.await(30, TimeUnit.SECONDS), "new input must reach restarted source");
+        assertEquals("unfinished", unfinishedSink.active.get().key(),
+            "restart must resume after committed inputs rather than replaying them");
+        assertNotCommittedPast(group, partition, unfinished.offset(), Duration.ofSeconds(1));
+        stopTask(); // Interrupt the sink before releasing it, so this record remains unfinished.
+        assertEquals(unfinished.offset(), committed(group, partition));
+        assertTrue(unfinishedSink.published.isEmpty());
+
+        GateSink replaySink = gate();
+        replaySink.release.countDown();
+        source = new KafkaSource(connector, List.of(input), "source-replay-" + suffix, 100);
+        startTask(replaySink);
+        Record<String, String> replay = receivePublished(replaySink);
+        assertNotNull(replay, "unfinished input must be replayed from the broker after restart");
+        assertEquals("unfinished", replay.key());
+        assertEquals(Long.toString(unfinished.offset()),
+            new String(replay.headers().lastHeader("kafka.offset").value(), StandardCharsets.UTF_8));
+        awaitCommitted(group, partition, unfinished.offset() + 1);
+        long deadline = System.nanoTime() + NEGATIVE_WINDOW.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            assertNull(replaySink.published.poll(250, TimeUnit.MILLISECONDS),
+                "committed inputs and the completed replay must not be duplicated on clean restart");
+        }
+    }
+
+    @Test
+    void maintainsConsumerMembershipWhileTaskProcessingExceedsMaxPollInterval() throws Exception {
+        String suffix = suffix();
+        String input = "it-membership-" + suffix;
+        String group = "it-membership-group-" + suffix;
+        TopicPartition partition = new TopicPartition(input, 0);
+        createTopics(input);
+        createPublisher();
+        send(input, "slow", payload("slow", 25), System.currentTimeMillis(), new RecordHeaders());
+        int maxPollIntervalMillis = 3_000;
+        Connector connector = connector(group, Map.of(
+            ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, maxPollIntervalMillis,
+            ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 6_000,
+            ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 1_000,
+            ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 10));
+        GateSink sink = gate();
+        source = new KafkaSource(connector, List.of(input), "source-slow-" + suffix, 100);
+        startTask(sink);
+        assertTrue(sink.entered.await(30, TimeUnit.SECONDS), "input must reach the blocked sink");
+        MemberDescription initial = awaitAssigned(group, partition);
+        long deadline = System.nanoTime() + Duration.ofMillis(maxPollIntervalMillis * 2L + 500).toNanos();
+        do {
+            assertTaskHealthy();
+            ConsumerGroupDescription description = describeGroup(group);
+            assertEquals(1, description.members().size(), "paused owner must retain group membership");
+            MemberDescription current = description.members().iterator().next();
+            assertEquals(initial.consumerId(), current.consumerId(), "processing must not force a rejoin");
+            assertEquals(Set.of(partition), current.assignment().topicPartitions());
+            assertTrue(committed(group, partition) <= 0, "blocked sink must not advance broker offsets");
+            Thread.sleep(100);
+        } while (System.nanoTime() < deadline);
+        assertTrue(sink.published.isEmpty());
+        sink.release.countDown();
+        assertNotNull(receivePublished(sink));
+        awaitCommitted(group, partition, 1);
+        assertTaskHealthy();
+    }
+
+    private static String suffix() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static Connector connector(String group, Map<String, Object> overrides) {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        properties.put(ConsumerConfig.GROUP_ID_CONFIG, group);
+        properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        properties.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30_000);
+        properties.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000);
+        properties.putAll(overrides);
+        Connector connector = new Connector();
+        connector.setType(ConnectorType.Kafka);
+        connector.setProperties(properties);
+        return connector;
+    }
+
+    private void createTopics(String... topics) throws Exception {
+        admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers(),
+            "default.api.timeout.ms", 30_000, "request.timeout.ms", 10_000));
+        List<NewTopic> definitions = new ArrayList<>();
+        for (String topic : topics) {
+            definitions.add(new NewTopic(topic, 1, (short) 1)
+                .configs(Map.of("message.timestamp.type", "CreateTime")));
+        }
+        admin.createTopics(definitions).all().get(30, TimeUnit.SECONDS);
+    }
+
+    private void createPublisher() {
+        publisher = new KafkaProducer<>(Map.of(
+            ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+            ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+            ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+            ProducerConfig.ACKS_CONFIG, "all",
+            ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000,
+            ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000,
+            ProducerConfig.MAX_BLOCK_MS_CONFIG, 30_000));
+    }
+
+    private RecordMetadata send(String topic, String key, String value, long timestamp, Headers headers)
+            throws Exception {
+        return publisher.send(new ProducerRecord<>(topic, 0, timestamp, key, value, headers))
+            .get(30, TimeUnit.SECONDS);
+    }
+
+    private static String payload(String device, int temperature) {
+        return "{\"device\":\"" + device + "\",\"temp\":" + temperature + "}";
+    }
+
+    private static Headers richHeaders(String routedTopic) {
+        Headers headers = new RecordHeaders()
+            .add("label", utf8("blue")).add("label", utf8("green"))
+            .add("binary", BINARY_HEADER).add("nullable", null)
+            .add("$__messageId", utf8("upstream-message"))
+            .add("$__publisherClientId", utf8("upstream-publisher"))
+            .add("src.mqtt.topic", utf8("upstream/mqtt")).add("src.rmq.topic", utf8("upstream-rmq"))
+            .add("src.kafka.topic", utf8("forged-source")).add("src.kafka.topic", utf8("forged-again"))
+            .add("kafka.partition", utf8("999")).add("kafka.offset", utf8("999"));
+        if (routedTopic != null) {
+            headers.add("dst.kafka.topic", utf8(routedTopic));
+        }
+        return headers;
+    }
+
+    private void createVerifier(String... topics) {
+        verifier = new KafkaConsumer<>(Map.of(
+            ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+            ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+            ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+            ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
+            ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30_000,
+            ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10_000));
+        List<TopicPartition> partitions = new ArrayList<>();
+        for (String topic : topics) {
+            partitions.add(new TopicPartition(topic, 0));
+        }
+        verifier.assign(partitions);
+        verifier.seekToBeginning(partitions);
+    }
+
+    private void startTask(Sink sink) {
+        Task task;
+        try {
+            task = new Task("integration", source, new SQLTransform<>(SQL), sink, 1);
+        } catch (RuntimeException | Error failure) {
+            try {
+                source.close();
+            } finally {
+                sink.close();
+            }
+            throw failure;
+        }
+        shuttingDown.set(false);
+        taskThread = Thread.ofVirtual().name("task-kafka-source-integration").start(() -> {
+            try {
+                task.launch();
+                if (!shuttingDown.get()) {
+                    taskFailure.compareAndSet(null, new IllegalStateException("lane exited before explicit shutdown"));
+                }
+            } catch (InterruptedException failure) {
+                if (!shuttingDown.get()) {
+                    taskFailure.compareAndSet(null, failure);
+                }
+                Thread.currentThread().interrupt();
+            } catch (Throwable failure) {
+                if (shuttingDown.get() && failure instanceof RuntimeException
+                        && failure.getCause() instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                } else {
+                    taskFailure.compareAndSet(null, failure);
+                }
+            }
+        });
+    }
+
+    private void stopTask() throws InterruptedException {
+        shuttingDown.set(true);
+        if (taskThread != null) {
+            taskThread.interrupt();
+            taskThread.join(15_000);
+            assertFalse(taskThread.isAlive(), "lane and consumer owner must stop within the bounded close timeout");
+            taskThread = null;
+        }
+        assertTaskHealthy();
+    }
+
+    private GateSink gate() {
+        GateSink sink = new GateSink();
+        gates.add(sink);
+        return sink;
+    }
+
+    private static final class GateSink implements Sink {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicReference<Record<String, String>> active = new AtomicReference<>();
+        final LinkedBlockingQueue<Record<String, String>> published = new LinkedBlockingQueue<>();
+
+        @Override
+        public void publish(Record<String, String> record) {
+            active.set(record);
+            entered.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(failure);
+            }
+            published.add(record);
+        }
+
+        @Override
+        public void close() {
+            release.countDown();
+        }
+    }
+
+    private Record<String, String> receivePublished(GateSink sink) throws InterruptedException {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            Record<String, String> record = sink.published.poll(250, TimeUnit.MILLISECONDS);
+            if (record != null) {
+                return record;
+            }
+        }
+        fail("expected a completed SQL result from the sink");
+        return null;
+    }
+
+    private ConsumerGroupDescription describeGroup(String group) throws Exception {
+        return admin.describeConsumerGroups(List.of(group)).describedGroups().get(group)
+            .get(10, TimeUnit.SECONDS);
+    }
+
+    private MemberDescription awaitAssigned(String group, TopicPartition partition) throws Exception {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            ConsumerGroupDescription description = describeGroup(group);
+            if (description.members().size() == 1) {
+                MemberDescription member = description.members().iterator().next();
+                if (member.assignment().topicPartitions().equals(Set.of(partition))) {
+                    return member;
+                }
+            }
+            Thread.sleep(100);
+        }
+        fail("consumer did not obtain assignment for " + partition);
+        return null;
+    }
+
+    private long committed(String group, TopicPartition partition) throws Exception {
+        OffsetAndMetadata offset = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata()
+            .get(10, TimeUnit.SECONDS).get(partition);
+        return offset == null ? -1 : offset.offset();
+    }
+
+    private void awaitCommitted(String group, TopicPartition partition, long expected) throws Exception {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        long actual = -1;
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            actual = committed(group, partition);
+            assertTrue(actual <= expected, "source must never commit past the completed prefix");
+            if (actual == expected) {
+                return;
+            }
+            Thread.sleep(100);
+        }
+        assertEquals(expected, actual, "broker must persist the completed next offset");
+    }
+
+    private void assertNotCommittedPast(String group, TopicPartition partition, long unfinishedOffset,
+            Duration observation) throws Exception {
+        long deadline = System.nanoTime() + observation.toNanos();
+        do {
+            assertTaskHealthy();
+            assertTrue(committed(group, partition) <= unfinishedOffset,
+                "broker offset must not pass the active unfinished record or its buffered followers");
+            Thread.sleep(100);
+        } while (System.nanoTime() < deadline);
+    }
+
+    private List<ConsumerRecord<String, String>> receiveRecords(int expected) {
+        List<ConsumerRecord<String, String>> records = new ArrayList<>();
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        while (records.size() < expected && System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            verifier.poll(Duration.ofMillis(250)).forEach(records::add);
+        }
+        assertEquals(expected, records.size(), "only matching, non-tombstone, non-loop inputs should be published");
+        return records;
+    }
+
+    private void assertNoMoreRecords() {
+        long deadline = System.nanoTime() + NEGATIVE_WINDOW.toNanos();
+        while (System.nanoTime() < deadline) {
+            assertTaskHealthy();
+            assertTrue(verifier.poll(Duration.ofMillis(250)).isEmpty(), "no filtered/tombstone/loop/routing copies");
+        }
+    }
+
+    private void assertTaskHealthy() {
+        if (taskFailure.get() != null) {
+            fail("task lane terminated unexpectedly", taskFailure.get());
+        }
+    }
+
+    private static ConsumerRecord<String, String> onTopic(List<ConsumerRecord<String, String>> records,
+            String topic) {
+        List<ConsumerRecord<String, String>> matching = records.stream()
+            .filter(record -> record.topic().equals(topic)).toList();
+        assertEquals(1, matching.size(), "expected exactly one SQL result on " + topic);
+        return matching.getFirst();
+    }
+
+    private static void assertOutput(ConsumerRecord<String, String> record, String device, int doubled,
+            String key, long timestamp, String inputTopic, RecordMetadata input) throws Exception {
+        assertEquals(MAPPER.valueToTree(Map.of("device", device, "doubled", doubled)), MAPPER.readTree(record.value()));
+        assertEquals(key, record.key());
+        assertEquals(timestamp, record.timestamp());
+        assertEquals(List.of(inputTopic), headerValues(record, "src.kafka.topic"));
+        assertEquals(List.of(Integer.toString(input.partition())), headerValues(record, "kafka.partition"));
+        assertEquals(List.of(Long.toString(input.offset())), headerValues(record, "kafka.offset"));
+        assertEquals("1", header(record, Task.HOP_COUNT_HEADER));
+    }
+
+    private static String header(ConsumerRecord<String, String> record, String key) {
+        Header header = record.headers().lastHeader(key);
+        assertNotNull(header, "missing header " + key);
+        assertNotNull(header.value(), "null header " + key);
+        return new String(header.value(), StandardCharsets.UTF_8);
+    }
+
+    private static List<String> headerValues(ConsumerRecord<String, String> record, String key) {
+        List<String> values = new ArrayList<>();
+        for (Header header : record.headers().headers(key)) {
+            values.add(new String(header.value(), StandardCharsets.UTF_8));
+        }
+        return values;
+    }
+
+    private static byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @AfterEach
+    void tearDown() {
+        assertAll("stop task and close every client even if a cleanup fails",
+            this::stopTask,
+            () -> {
+                for (GateSink sink : gates) {
+                    sink.release.countDown();
+                }
+                if (source != null) {
+                    source.close();
+                }
+            },
+            () -> {
+                if (publisher != null) {
+                    publisher.close(Duration.ofSeconds(10));
+                }
+            },
+            () -> {
+                if (verifier != null) {
+                    verifier.close(Duration.ofSeconds(10));
+                }
+            },
+            () -> {
+                if (admin != null) {
+                    admin.close(Duration.ofSeconds(10));
+                }
+            },
+            this::assertTaskHealthy);
+    }
+}

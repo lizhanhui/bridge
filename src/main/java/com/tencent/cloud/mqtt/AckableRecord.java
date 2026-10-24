@@ -9,7 +9,8 @@ import org.apache.kafka.streams.processor.api.Record;
  * {@link Task}) must call {@link #ack()} once the record is fully processed:
  * filtered out by the transform, deliberately dropped (e.g. max_hops), or
  * after all derived records have been durably sunk. Never acking means the
- * broker redelivers — that is the crash-safety contract.
+ * broker redelivers — that is the crash-safety contract. Kafka acknowledgements
+ * mark in-memory completion; batched commits may replay completed records too.
  *
  * <p>Each {@link Source} implementation provides a subtype holding its own
  * ack context (e.g. the MQTT subtype holds the received {@code Mqtt5Publish}).

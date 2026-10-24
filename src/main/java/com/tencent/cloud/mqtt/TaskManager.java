@@ -17,6 +17,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tencent.cloud.mqtt.kafka.KafkaClients;
 import com.tencent.cloud.mqtt.kafka.KafkaSink;
+import com.tencent.cloud.mqtt.kafka.KafkaSource;
 import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
 import com.tencent.cloud.mqtt.mqtt.MqttSink;
@@ -183,10 +184,39 @@ public class TaskManager {
         return connectors;
     }
 
+    record KafkaSourceSpec(List<String> topics, long commitIntervalMillis) {}
+
+    static KafkaSourceSpec parseKafkaSourceSpec(JsonNode node) {
+        JsonNode topicsNode = node.get("topics");
+        if (topicsNode == null || !topicsNode.isArray() || topicsNode.isEmpty()) {
+            throw new IllegalArgumentException("Kafka source topics must be a nonempty array of topic names");
+        }
+        List<String> topics = new ArrayList<>();
+        for (JsonNode topic : topicsNode) {
+            if (!topic.isTextual()) {
+                throw new IllegalArgumentException("Kafka source topics must contain only strings");
+            }
+            topics.add(topic.textValue());
+        }
+        KafkaSource.validateTopics(topics);
+        long interval = KafkaSource.DEFAULT_COMMIT_INTERVAL_MILLIS;
+        if (node.has("commit_interval_ms")) {
+            JsonNode intervalNode = node.get("commit_interval_ms");
+            if (!intervalNode.isIntegralNumber() || !intervalNode.canConvertToLong() || intervalNode.longValue() <= 0) {
+                throw new IllegalArgumentException("Kafka source commit_interval_ms must be a positive long integer");
+            }
+            interval = intervalNode.longValue();
+        }
+        return new KafkaSourceSpec(List.copyOf(topics), interval);
+    }
+
     static Source parseSource(JsonNode node, Map<String, Connector> connectors, String taskName) {
         Connector connector = resolveConnector(node, connectors);
         return switch (connector.getType()) {
-            case Kafka -> throw new IllegalArgumentException("Kafka source is not supported");
+            case Kafka -> {
+                KafkaSourceSpec spec = parseKafkaSourceSpec(node);
+                yield new KafkaSource(connector, spec.topics(), "source-" + taskName, spec.commitIntervalMillis());
+            }
             case MQTT -> new MqttSource(connector, node.required("topic_filter").asText(),
                 "source-" + taskName);
             case RocketMQ -> new RocketMQSource(connector, node.required("consumer_group").asText(),

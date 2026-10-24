@@ -108,15 +108,47 @@ class TaskManagerTest {
     }
 
     @Test
-    void kafkaSourceIsRejectedExplicitlyWithoutBuildingClients() throws Exception {
-        Connector connector = new Connector();
-        connector.setType(ConnectorType.Kafka);
-        JsonNode source = MAPPER.readTree("{\"connector_id\":\"k\"}");
-        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+    void kafkaSourceFieldsUseExactTopicsAndDefaultOrPositiveLongCommitInterval() throws Exception {
+        TaskManager.KafkaSourceSpec defaults = TaskManager.parseKafkaSourceSpec(
+            MAPPER.readTree("{\"topics\":[\"input-0\",\"input_1\"]}"));
+        assertEquals(List.of("input-0", "input_1"), defaults.topics());
+        assertEquals(1000, defaults.commitIntervalMillis());
+        assertEquals(Long.MAX_VALUE, TaskManager.parseKafkaSourceSpec(MAPPER.readTree(
+            "{\"topics\":[\"input\"],\"commit_interval_ms\":9223372036854775807}")).commitIntervalMillis());
+    }
+
+    @Test
+    void kafkaSourceRejectsNonArrayNonTextAndInvalidTopicsWithoutBuildingClients() throws Exception {
+        for (String fields : List.of("{}", "{\"topics\":null}", "{\"topics\":\"input\"}",
+                "{\"topics\":{\"input\":true}}", "{\"topics\":[]}", "{\"topics\":[null]}",
+                "{\"topics\":[123]}", "{\"topics\":[\"\"]}", "{\"topics\":[\"bad/topic\"]}",
+                "{\"topics\":[\".\"]}", "{\"topics\":[\"..\"]}")) {
+            JsonNode source = MAPPER.readTree(fields);
+            assertThrows(IllegalArgumentException.class, () -> TaskManager.parseKafkaSourceSpec(source), fields);
+        }
+    }
+
+    @Test
+    void kafkaSourceRejectsInvalidCommitIntervalAtJsonBoundary() throws Exception {
+        for (String interval : List.of("null", "0", "-1", "1.5", "\"1000\"", "true",
+                "9223372036854775808", "[]", "{}")) {
+            JsonNode source = MAPPER.readTree("{\"topics\":[\"input\"],\"commit_interval_ms\":" + interval + "}");
+            assertThrows(IllegalArgumentException.class, () -> TaskManager.parseKafkaSourceSpec(source), interval);
+        }
+    }
+
+    @Test
+    void kafkaSourceRequiresGroupAndExplicitResetButSinkOnlyConnectorDoesNot() throws Exception {
+        Connector connector = TaskManager.parseConnectors(MAPPER.readTree(
+            "[{\"id\":\"k\",\"type\":\"Kafka\",\"properties\":{\"bootstrap.servers\":\"localhost:9092\"}}]")).get("k");
+        JsonNode source = MAPPER.readTree("{\"connector_id\":\"k\",\"topics\":[\"input\"]}");
+        IllegalArgumentException group = assertThrows(IllegalArgumentException.class,
             () -> TaskManager.parseSource(source, Map.of("k", connector), "task-0"));
-        assertTrue(failure.getMessage().contains("Kafka"));
-        assertTrue(failure.getMessage().toLowerCase().contains("source"));
-        assertTrue(failure.getMessage().toLowerCase().contains("not supported"));
+        assertTrue(group.getMessage().contains("group.id"));
+        connector.setProperties(Map.of("bootstrap.servers", "localhost:9092", "group.id", "group"));
+        IllegalArgumentException reset = assertThrows(IllegalArgumentException.class,
+            () -> TaskManager.parseSource(source, Map.of("k", connector), "task-0"));
+        assertTrue(reset.getMessage().contains("auto.offset.reset"));
     }
 
     @Test
