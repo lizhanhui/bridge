@@ -1,11 +1,23 @@
 package com.tencent.cloud.mqtt.model;
 
+import java.util.HashMap;
+import java.util.Map;
+
 public class Connector {
     private String id;
     private ConnectorType type;
     private String accessPoint;
     private String username;
     private String password;
+    private Map<String, Object> properties = new HashMap<>();
+
+    public Map<String, Object> getProperties() {
+        return properties;
+    }
+
+    public void setProperties(Map<String, Object> properties) {
+        this.properties = properties;
+    }
 
     public String getId() {
         return id;

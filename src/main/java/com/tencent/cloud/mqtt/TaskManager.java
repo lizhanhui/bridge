@@ -12,8 +12,11 @@ import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tencent.cloud.mqtt.kafka.KafkaClients;
+import com.tencent.cloud.mqtt.kafka.KafkaSink;
 import com.tencent.cloud.mqtt.model.Connector;
 import com.tencent.cloud.mqtt.model.ConnectorType;
 import com.tencent.cloud.mqtt.mqtt.MqttSink;
@@ -154,13 +157,25 @@ public class TaskManager {
         }
     }
 
-    private static Map<String, Connector> parseConnectors(JsonNode connectorsNode) {
+    static Map<String, Connector> parseConnectors(JsonNode connectorsNode) {
         Map<String, Connector> connectors = new HashMap<>();
         for (JsonNode node : connectorsNode) {
             Connector connector = new Connector();
             connector.setId(node.required("id").asText());
             connector.setType(ConnectorType.valueOf(node.required("type").asText()));
-            connector.setAccessPoint(node.required("access_point").asText());
+            connector.setAccessPoint(connector.getType() == ConnectorType.Kafka
+                ? node.path("access_point").asText(null) : node.required("access_point").asText());
+            if (connector.getType() == ConnectorType.Kafka && node.has("properties")) {
+                JsonNode properties = node.get("properties");
+                if (!properties.isObject()) {
+                    throw new IllegalArgumentException("Connector properties must be an object");
+                }
+                connector.setProperties(new ObjectMapper().convertValue(properties,
+                    new TypeReference<Map<String, Object>>() {}));
+            }
+            if (connector.getType() == ConnectorType.Kafka) {
+                KafkaClients.validateBootstrapServers(connector.getProperties());
+            }
             connector.setUsername(node.path("username").asText(null));
             connector.setPassword(node.path("password").asText(null));
             connectors.put(connector.getId(), connector);
@@ -168,9 +183,10 @@ public class TaskManager {
         return connectors;
     }
 
-    private static Source parseSource(JsonNode node, Map<String, Connector> connectors, String taskName) {
+    static Source parseSource(JsonNode node, Map<String, Connector> connectors, String taskName) {
         Connector connector = resolveConnector(node, connectors);
         return switch (connector.getType()) {
+            case Kafka -> throw new IllegalArgumentException("Kafka source is not supported");
             case MQTT -> new MqttSource(connector, node.required("topic_filter").asText(),
                 "source-" + taskName);
             case RocketMQ -> new RocketMQSource(connector, node.required("consumer_group").asText(),
@@ -192,6 +208,7 @@ public class TaskManager {
     private static Sink parseSink(JsonNode node, Map<String, Connector> connectors, String taskName) {
         Connector connector = resolveConnector(node, connectors);
         return switch (connector.getType()) {
+            case Kafka -> new KafkaSink(connector, node.required("topic").asText(), "sink-" + taskName);
             case MQTT -> new MqttSink(connector, node.required("topic").asText(),
                 "sink-" + taskName);
             case RocketMQ -> new RocketMQSink(connector, node.required("topic").asText());
